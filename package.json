@@ -1,0 +1,39 @@
+{
+  "name": "hunk-checkpoint",
+  "version": "0.1.0",
+  "description": "Incremental review rounds for Hunk: checkpoint the working tree when a review is done, then diff only what the agent changed since.",
+  "license": "MIT",
+  "author": "Dor Shinar <dors718@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dorshinar/hunk-checkpoint.git"
+  },
+  "homepage": "https://github.com/dorshinar/hunk-checkpoint#readme",
+  "bugs": {
+    "url": "https://github.com/dorshinar/hunk-checkpoint/issues"
+  },
+  "keywords": [
+    "hunk",
+    "hunk-extension",
+    "code-review",
+    "diff",
+    "git",
+    "herdr"
+  ],
+  "type": "module",
+  "hunk": {
+    "apiVersion": 28,
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test \"test/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "hunkdiff": "0.23.0",
+    "typescript": "^5.9.0"
+  }
+}
