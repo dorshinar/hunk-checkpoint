@@ -11,6 +11,7 @@ import {
   markCheckpoint,
   parseLogEntries,
   readCheckpoint,
+  readHead,
   resolveRepo,
   shortStat,
   snapshotLive,
@@ -52,8 +53,7 @@ describe("checkpoint plumbing", () => {
     fs.mkdirSync(join(root, "nested"), { recursive: true });
     const repo = await resolveRepo(join(root, "nested"));
     assert.equal(fs.realpathSync(repo.root), fs.realpathSync(root));
-    assert.equal(repo.branch, "main");
-    assert.equal(repo.head, sh(root, "rev-parse", "HEAD"));
+    assert.deepEqual(await readHead(repo), { head: sh(root, "rev-parse", "HEAD"), branch: "main" });
   });
 
   it("has no checkpoint before one is marked", async () => {
@@ -64,6 +64,7 @@ describe("checkpoint plumbing", () => {
 
   it("snapshots tracked edits and untracked files without touching the real index", async () => {
     const repo = await resolveRepo(root);
+    const head = sh(root, "rev-parse", "HEAD");
     write(root, "tracked.txt", "round one\n");
     write(root, "fresh.txt", "new file\n");
     write(root, "ignored.log", "noise\n");
@@ -71,7 +72,7 @@ describe("checkpoint plumbing", () => {
     const checkpoint = (await markCheckpoint(repo, { note: "first pass" }))!;
 
     assert.equal(sh(root, "rev-parse", CHECKPOINT_REF), checkpoint.sha);
-    assert.equal(sh(root, "rev-parse", `${checkpoint.sha}^`), repo.head, "first checkpoint parents HEAD");
+    assert.equal(sh(root, "rev-parse", `${checkpoint.sha}^`), head, "first checkpoint parents HEAD");
     const files = sh(root, "ls-tree", "-r", "--name-only", checkpoint.sha).split("\n");
     assert.ok(files.includes("fresh.txt"), "untracked file is in the snapshot");
     assert.ok(!files.includes("ignored.log"), "ignored file stays out");
@@ -84,7 +85,7 @@ describe("checkpoint plumbing", () => {
       ["M tracked.txt", "?? fresh.txt"],
       "nothing got staged",
     );
-    assert.equal(sh(root, "rev-parse", "HEAD"), repo.head);
+    assert.equal(sh(root, "rev-parse", "HEAD"), head);
     assert.equal(sh(root, "symbolic-ref", "--short", "HEAD"), "main");
   });
 
@@ -116,10 +117,10 @@ describe("checkpoint plumbing", () => {
     assert.match(second.subject, /round 2 on main/);
   });
 
-  it("skips marking with ifChanged when the tree equals the checkpoint", async () => {
+  it("skips marking when the tree equals the given round", async () => {
     const repo = await resolveRepo(root);
     const current = (await readCheckpoint(repo))!;
-    assert.equal(await markCheckpoint(repo, { ifChanged: true }), null);
+    assert.equal(await markCheckpoint(repo, { skipIfSameAs: current.sha }), null);
     assert.equal((await readCheckpoint(repo))!.sha, current.sha);
   });
 

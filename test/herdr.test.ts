@@ -25,8 +25,11 @@ describe("turn model", () => {
 
   it("reads start and end edges", () => {
     const tracker = new TurnTracker();
+    assert.equal(tracker.inTurn, false);
     assert.deepEqual(tracker.observe("working"), { started: false, ended: false }, "first sample never starts a turn");
+    assert.equal(tracker.inTurn, true, "work was seen, so a rest would end a turn");
     assert.deepEqual(tracker.observe("resting"), { started: false, ended: true }, "but work seen earlier still ends");
+    assert.equal(tracker.inTurn, false);
     assert.deepEqual(tracker.observe("working"), { started: true, ended: false });
     assert.deepEqual(tracker.observe("neither"), { started: false, ended: false }, "a permission prompt holds the turn");
     assert.deepEqual(tracker.observe("resting"), { started: false, ended: true });

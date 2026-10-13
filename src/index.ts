@@ -1,28 +1,25 @@
-import { appendFileSync, readFileSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { appendFileSync } from "node:fs";
 import type {
   ExtensionCommandContext,
   ExtensionEventContext,
   ExtensionStatusLineControls,
   HunkExtensionAPI,
 } from "hunkdiff/extension";
+import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
 import {
-  clearCheckpoints,
   listCheckpoints,
   markCheckpoint,
-  readCheckpoint,
   resolveRepo,
   short,
   snapshotLive,
   treeOf,
-  workingTreeSignature,
   type Checkpoint,
   type GitRepo,
 } from "./git.ts";
 import { HerdrTurnWatcher, herdrSocketPath } from "./herdr.ts";
 import { deriveMode, formatAge, statusSpans, type ViewMode } from "./mode.ts";
+import { WorkingTreePoller } from "./poll.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
 
 /**
@@ -47,33 +44,7 @@ import { listSessions, reloadSession, selectSession, type LiveSession, type Revi
 
 const KEYS = { mark: "C", toggle: "x", pick: "X" };
 const STATUS_ITEM = "state";
-
-/** Which build of this extension is running: package version plus the entry file's mtime. */
-function buildStamp() {
-  const source = fileURLToPath(import.meta.url);
-  let version = "?";
-  try {
-    version = String((JSON.parse(readFileSync(join(dirname(source), "..", "package.json"), "utf8")) as { version?: string }).version ?? "?");
-  } catch {
-    // A single-file install has no manifest beside it.
-  }
-  let modified = "";
-  try {
-    modified = statSync(source).mtime.toISOString().slice(5, 16).replace("T", " ");
-  } catch {
-    // Unreadable source: the version alone will do.
-  }
-  return {
-    source,
-    version,
-    modified,
-    /** Full form for the About dialog. */
-    label: `hunk-checkpoint ${version}${modified ? ` (source modified ${modified} UTC)` : ""}`,
-    /** Compact form that survives a toast's width. */
-    short: `v${version}${modified ? ` src ${modified}` : ""}`,
-  };
-}
-const BUILD = buildStamp();
+const BUILD = buildStamp(import.meta.url);
 
 /** Append one diagnostic line when HUNK_CHECKPOINT_DEBUG names a file; `hunk.log` is never shown. */
 function debug(message: string) {
@@ -90,19 +61,28 @@ interface ReviewHost {
 
 interface State {
   repo: GitRepo | null;
-  checkpoint: Checkpoint | null;
-  /** Every checkpoint sha this worktree knows, newest first. */
-  known: string[];
+  /**
+   * This window's baseline: the last round snapshotted *here* (`C`, a turn
+   * start, or `r` in manual mode). Rounds stored by earlier windows stay in
+   * the worktree and are reachable through `X`, but are never assumed.
+   */
+  baseline: Checkpoint | null;
+  /** Every round stored for this worktree, newest first (for `X` and title matching). */
+  rounds: Checkpoint[];
   /** What the mounted review compares, read from its title. */
   view: ViewMode;
   /** Checkpoint mode, toggled with `x`; every launch starts with it off. */
   mode: boolean;
   busy: boolean;
   session: LiveSession | null;
-  lastSignature: string | null;
   /** Controls from the newest review generation; older handles go inert on reload. */
   host: ReviewHost | null;
+  watcher: HerdrTurnWatcher | null;
+  warnedAboutAutomatic: boolean;
 }
+
+/** What showing a round did: reloaded the review, left it alone (nothing changed), or could not run. */
+type RoundOutcome = "shown" | "empty" | "busy";
 
 export default function (hunk: HunkExtensionAPI) {
   const herdrSocket = herdrSocketPath();
@@ -116,18 +96,16 @@ export default function (hunk: HunkExtensionAPI) {
 
   const state: State = {
     repo: null,
-    checkpoint: null,
-    known: [],
+    baseline: null,
+    rounds: [],
     view: { kind: "working-tree" },
     mode: false,
     busy: false,
     session: null,
-    lastSignature: null,
     host: null,
+    watcher: null,
+    warnedAboutAutomatic: false,
   };
-  let poller: ReturnType<typeof setInterval> | null = null;
-  let watcher: HerdrTurnWatcher | null = null;
-  let warnedAboutAutomatic = false;
 
   /* ---------------------------------------------------------------------- */
   /* State                                                                   */
@@ -138,11 +116,34 @@ export default function (hunk: HunkExtensionAPI) {
     return state.repo;
   }
 
-  async function refreshCheckpoint(cwd: string) {
+  /** Re-read the rounds stored for this worktree (the window's baseline is not affected). */
+  async function refreshRounds(cwd: string) {
     const repo = await ensureRepo(cwd);
-    state.checkpoint = await readCheckpoint(repo);
-    state.known = state.checkpoint ? (await listCheckpoints(repo)).map((entry) => entry.sha) : [];
-    return state.checkpoint;
+    state.rounds = await listCheckpoints(repo);
+    return repo;
+  }
+
+  /** Snapshot the working tree as a new round and make it the baseline; null when its tree equals `skipIfSameAs`. */
+  async function markBaseline(repo: GitRepo, skipIfSameAs?: string) {
+    const next = await markCheckpoint(repo, { skipIfSameAs });
+    await refreshRounds(repo.root);
+    if (next) state.baseline = next;
+    return next;
+  }
+
+  /** Expand a short sha from a review title back to the full round id when known. */
+  function expandSha(prefix: string) {
+    return state.rounds.find((round) => round.sha.startsWith(prefix))?.sha ?? prefix;
+  }
+
+  /**
+   * What a round refresh compares against: the base of the since-view on
+   * screen when there is one (it may have been mounted by `X` or by an agent's
+   * `hunk checkpoint sync`), otherwise this window's baseline.
+   */
+  function roundBase() {
+    if (state.view.kind === "since-checkpoint") return expandSha(state.view.base);
+    return state.baseline?.sha ?? null;
   }
 
   function publishStatus(fallback?: ExtensionStatusLineControls) {
@@ -151,7 +152,7 @@ export default function (hunk: HunkExtensionAPI) {
     // prefer the handle the latest lifecycle event delivered.
     const statusLine = state.host?.statusLine ?? fallback;
     if (!statusLine) return;
-    if (!state.mode && !state.checkpoint && !state.busy) {
+    if (!state.mode && !state.busy && !state.baseline) {
       statusLine.clear(STATUS_ITEM);
       return;
     }
@@ -160,7 +161,7 @@ export default function (hunk: HunkExtensionAPI) {
       alignment: "right",
       priority: 5,
       spans: statusSpans({
-        checkpoint: state.checkpoint,
+        checkpoint: state.baseline,
         view: state.view,
         mode: state.mode,
         manual,
@@ -170,6 +171,7 @@ export default function (hunk: HunkExtensionAPI) {
     });
   }
 
+  /** Run `work` as the one snapshot in flight; resolves undefined (after a toast) when another is. */
   async function withBusy<T>(ctx: ReviewHost, work: () => Promise<T>) {
     if (state.busy) {
       debug(`withBusy refused: ${new Error().stack?.split("\n")[2]?.trim()}`);
@@ -189,11 +191,6 @@ export default function (hunk: HunkExtensionAPI) {
 
   function adoptHost(ctx: ExtensionEventContext) {
     state.host = { statusLine: ctx.statusLine, notify: (message, type) => ctx.notify(message, type) };
-  }
-
-  /** Expand a short sha from a review title back to the full checkpoint id when known. */
-  function resolveKnown(prefix: string) {
-    return state.known.find((sha) => sha.startsWith(prefix)) ?? prefix;
   }
 
   /* ---------------------------------------------------------------------- */
@@ -229,43 +226,36 @@ export default function (hunk: HunkExtensionAPI) {
   }
 
   /**
-   * Snapshot the working tree now and point the session at `base..snapshot`.
-   * Returns false when nothing changed since `base` (the review is left alone).
+   * Snapshot the working tree and point the session at `base..snapshot`.
+   *
+   * A mounted since-view is always refreshed. Any other view is left alone
+   * when nothing changed since `base`, so the full diff does not give way to
+   * an empty round.
    */
-  async function showSinceCheckpoint(repo: GitRepo, baseSha: string, { evenIfEmpty = true } = {}) {
-    const live = await snapshotLive(repo, baseSha);
-    if (!evenIfEmpty && (await treeOf(repo, live)) === (await treeOf(repo, baseSha))) {
-      return false;
-    }
-    state.lastSignature = await workingTreeSignature(repo).catch(() => null);
-    await reload(repo, { kind: "range", from: baseSha, to: live });
-    return true;
+  async function showRound(host: ReviewHost, repo: GitRepo, base: string): Promise<RoundOutcome> {
+    const keepIfEmpty = state.view.kind !== "since-checkpoint";
+    const outcome = await withBusy(host, async (): Promise<RoundOutcome> => {
+      const live = await snapshotLive(repo, base);
+      if (keepIfEmpty && (await treeOf(repo, live)) === (await treeOf(repo, base))) return "empty";
+      await reload(repo, { kind: "range", from: base, to: live });
+      return "shown";
+    });
+    return outcome ?? "busy";
   }
 
-  /* ---------------------------------------------------------------------- */
-  /* Auto refresh by polling (opt-in, for setups without herdr)             */
-  /* ---------------------------------------------------------------------- */
-
-  function stopPolling() {
-    if (poller) clearInterval(poller);
-    poller = null;
-  }
-
-  function startPolling() {
-    stopPolling();
-    if (!(autoRefreshSeconds > 0)) return;
-    poller = setInterval(() => {
-      void (async () => {
-        if (state.busy || state.view.kind !== "since-checkpoint" || !state.repo || !state.host) return;
-        const signature = await workingTreeSignature(state.repo).catch(() => null);
-        if (signature === null || signature === state.lastSignature) return;
-        const base = resolveKnown(state.view.base);
-        const repo = state.repo;
-        await withBusy(state.host, () => showSinceCheckpoint(repo, base));
-      })().catch((error: unknown) => debug(`auto refresh failed: ${String(error)}`));
-    }, autoRefreshSeconds * 1000);
-    poller.unref?.();
-  }
+  /** Opt-in: keep a mounted since-view current while the tree moves (for setups without herdr). */
+  const poller =
+    autoRefreshSeconds > 0
+      ? new WorkingTreePoller({
+          intervalMs: autoRefreshSeconds * 1000,
+          log: debug,
+          onChange: async () => {
+            const base = roundBase();
+            if (!state.repo || !state.host || !base) return;
+            await showRound(state.host, state.repo, base);
+          },
+        })
+      : null;
 
   /* ---------------------------------------------------------------------- */
   /* Commands                                                                */
@@ -274,31 +264,30 @@ export default function (hunk: HunkExtensionAPI) {
   hunk.registerCommand(
     { id: "toggle", title: "Checkpoint mode: toggle on/off", key: KEYS.toggle },
     async (ctx) => {
-      const repo = await ensureRepo(ctx.cwd);
-      await refreshCheckpoint(ctx.cwd);
+      const repo = await refreshRounds(ctx.cwd);
       if (state.mode) {
-        // Off: the rounds belong to this mode session, so they go with it.
+        // Off: this window's baseline is forgotten; the stored rounds stay
+        // in the worktree for `X`.
         state.mode = false;
-        await clearCheckpoints(repo);
-        await refreshCheckpoint(ctx.cwd);
+        state.baseline = null;
         publishStatus(ctx.statusLine);
         if (state.view.kind === "since-checkpoint") {
           await withBusy(ctx, () => reload(repo, { kind: "working-tree" }));
         }
-        ctx.notify("Checkpoint mode off — snapshots dropped, showing the full diff");
+        ctx.notify("Checkpoint mode off — showing the full diff");
         return;
       }
-      // On: a fresh mode session. Rounds left behind by a window that closed
-      // while on are dropped, and the full diff stays on screen until a round
-      // closes (turn end in herdr, `r` by hand).
-      await clearCheckpoints(repo);
-      await refreshCheckpoint(ctx.cwd);
+      // On: a baseline marked with `C` while off is kept; otherwise the full
+      // diff stays on screen until a round closes (turn end in herdr, `r` by
+      // hand). Rounds from earlier windows are never assumed; `X` offers them.
       state.mode = true;
       publishStatus(ctx.statusLine);
+      const baseline = state.baseline ? `baseline ${short(state.baseline.sha)} is set, ` : "";
+      const earlier = state.rounds.length > 0 ? ` · ${KEYS.pick} compares with ${state.rounds.length} stored round(s)` : "";
       ctx.notify(
         manual
-          ? `Checkpoint mode on [${BUILD.short}] — ${KEYS.mark} sets the baseline, r closes a round and shows it against the previous one`
-          : `Checkpoint mode on [${BUILD.short}] — each agent turn is snapshotted when it starts and shown when it ends`,
+          ? `Checkpoint mode on [${BUILD.short}] — ${baseline || `${KEYS.mark} sets the baseline, `}r closes a round and shows it against the previous one${earlier}`
+          : `Checkpoint mode on [${BUILD.short}] — ${baseline}each agent turn is snapshotted when it starts and shown when it ends${earlier}`,
       );
     },
   );
@@ -306,13 +295,9 @@ export default function (hunk: HunkExtensionAPI) {
   hunk.registerCommand(
     { id: "mark", title: "Checkpoint: set the baseline now", key: KEYS.mark },
     async (ctx) => {
-      // Re-resolve rather than reuse the cache: HEAD and the branch may have
-      // moved since startup, and a first checkpoint parents HEAD.
-      const repo = await resolveRepo(ctx.cwd);
-      state.repo = repo;
+      const repo = await ensureRepo(ctx.cwd);
       await withBusy(ctx, async () => {
-        const checkpoint = (await markCheckpoint(repo))!;
-        await refreshCheckpoint(ctx.cwd);
+        const checkpoint = (await markBaseline(repo))!;
         ctx.notify(`Baseline ${short(checkpoint.sha)} saved${state.mode ? "" : ` — press ${KEYS.toggle} to turn checkpoint mode on`}`);
         if (state.view.kind === "since-checkpoint") {
           // The since-view would now be empty; fall back to the full diff.
@@ -323,73 +308,73 @@ export default function (hunk: HunkExtensionAPI) {
   );
 
   /**
-   * In checkpoint mode, `r` is the manual turn boundary: the working tree
-   * becomes the next checkpoint and the review shows it against the previous
-   * one, so every reload compares this round with the last. (Inside herdr the
-   * agent's turn edges do that by themselves, and `r` just refreshes the
-   * current round against its baseline.) Outside the mode, Hunk's own refresh
-   * is all that runs.
+   * `r` in checkpoint mode. By hand, it is the turn boundary: the working
+   * tree becomes the next round and the review shows it against the base on
+   * screen, so every reload compares this round with the last. Inside herdr
+   * the agent's turn edges do that by themselves, and `r` just refreshes the
+   * current round against its base.
    */
   async function refreshSince(ctx: ReviewHost, cwd: string) {
     const repo = await ensureRepo(cwd);
-    const checkpoint = await refreshCheckpoint(cwd);
-    if (!state.mode) return false;
-    if (!checkpoint) {
-      ctx.notify(manual ? `No baseline yet — press ${KEYS.mark} first` : "No baseline yet — it is set when the agent starts a turn", "warning");
-      return true;
+    if (state.view.kind === "other") {
+      ctx.notify("Rounds refresh the working tree or a since view; this review is neither", "warning");
+      return;
     }
-    const view = state.view;
-    if (view.kind !== "since-checkpoint" && view.kind !== "working-tree") return false;
+    const base = roundBase();
+    if (!base) {
+      ctx.notify(manual ? `No baseline yet — press ${KEYS.mark} first` : "No baseline yet — it is set when the agent starts a turn", "warning");
+      return;
+    }
     if (manual) {
       await withBusy(ctx, async () => {
-        const fresh = await resolveRepo(repo.root);
-        const next = await markCheckpoint(fresh, { ifChanged: true });
+        const next = await markBaseline(repo, base);
         if (!next) {
-          ctx.notify(`Nothing changed since round ${short(checkpoint.sha)} yet`);
+          ctx.notify(`Nothing changed since round ${short(base)} yet`);
           return;
         }
-        await refreshCheckpoint(cwd);
-        await reload(repo, { kind: "range", from: checkpoint.sha, to: next.sha });
-        ctx.notify(`Round ${short(next.sha)} closed — showing it against ${short(checkpoint.sha)}`);
+        await reload(repo, { kind: "range", from: base, to: next.sha });
+        ctx.notify(`Round ${short(next.sha)} closed — showing it against ${short(base)}`);
       });
-      return true;
+      return;
     }
-    const sinceView = view.kind === "since-checkpoint";
-    const base = view.kind === "since-checkpoint" ? resolveKnown(view.base) : checkpoint.sha;
-    const shown = await withBusy(ctx, () => showSinceCheckpoint(repo, base, { evenIfEmpty: sinceView }));
-    if (shown === false) ctx.notify(`Nothing changed since baseline ${short(base)} yet`);
-    return true;
+    if ((await showRound(ctx, repo, base)) === "empty") {
+      ctx.notify(`Nothing changed since baseline ${short(base)} yet`);
+    }
   }
 
   hunk.registerCommand(
     { id: "refresh", title: "Checkpoint: close this round and show it against the previous one" },
     async (ctx) => {
-      if (!(await refreshSince(ctx, ctx.cwd))) {
+      if (!state.mode) {
         ctx.notify(`Checkpoint mode is off — press ${KEYS.toggle} first`, "warning");
+        return;
       }
+      await refreshSince(ctx, ctx.cwd);
     },
   );
 
   hunk.registerCommand(
     { id: "pick", title: "Checkpoint: compare with an earlier baseline…", key: KEYS.pick },
     async (ctx) => {
-      const repo = await ensureRepo(ctx.cwd);
-      const checkpoints = await listCheckpoints(repo);
-      if (checkpoints.length === 0) {
-        ctx.notify("No checkpoint yet for this worktree", "warning");
+      const repo = await refreshRounds(ctx.cwd);
+      if (state.rounds.length === 0) {
+        ctx.notify("No rounds stored for this worktree yet", "warning");
         return;
       }
-      const labels = checkpoints.map(
+      const labels = state.rounds.map(
         (entry, index) =>
           `${index + 1}. ${short(entry.sha)} · ${formatAge(entry.createdAt)} · ${entry.subject.replace(/^hunk-checkpoint:\s*/, "")}`,
       );
       const chosen = await ctx.dialogs.select({ title: "Show changes since which checkpoint?", options: labels });
       if (!chosen) return;
-      const index = Number(/^(\d+)\./.exec(chosen)?.[1] ?? 0) - 1;
-      const target = checkpoints[index];
+      const target = state.rounds[Number(/^(\d+)\./.exec(chosen)?.[1] ?? 0) - 1];
       if (!target) return;
+      // The picked round is what is on screen from here on, so `r` and turn
+      // ends refresh against it; the window's own baseline is unchanged.
       state.mode = true;
-      await withBusy(ctx, () => showSinceCheckpoint(repo, target.sha));
+      if ((await showRound(ctx, repo, target.sha)) === "empty") {
+        ctx.notify(`Nothing changed since round ${short(target.sha)}`);
+      }
     },
   );
 
@@ -401,7 +386,7 @@ export default function (hunk: HunkExtensionAPI) {
         `source: ${BUILD.source}`,
         `extension API: ${hunk.apiVersion}`,
         `herdr: ${herdrEnabled ? `socket ${herdrSocket}` : "not detected"} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
-        `worktree: ${repo} · checkpoint mode: ${state.mode ? "on" : "off"}`,
+        `worktree: ${repo} · checkpoint mode: ${state.mode ? "on" : "off"} · baseline: ${state.baseline ? short(state.baseline.sha) : "none"} · stored rounds: ${state.rounds.length}`,
       ].join("\n"),
       confirmLabel: "ok",
       cancelLabel: "close",
@@ -418,7 +403,7 @@ export default function (hunk: HunkExtensionAPI) {
       summary: "Mark review rounds and review only what changed since the last one",
       usage: "<mark|status|list|sync|reset|diff|clear> [options]",
     },
-    createCliHandler(),
+    createCliHandler(BUILD),
   );
 
   /* ---------------------------------------------------------------------- */
@@ -427,9 +412,9 @@ export default function (hunk: HunkExtensionAPI) {
 
   /** Follow the agents of this worktree once the repo is known and herdr is around. */
   function ensureWatcher() {
-    if (watcher || !herdrEnabled || !herdrSocket || !state.repo) return;
+    if (state.watcher || !herdrEnabled || !herdrSocket || !state.repo) return;
     const repo = state.repo;
-    watcher = new HerdrTurnWatcher({
+    state.watcher = new HerdrTurnWatcher({
       socket: herdrSocket,
       repoRoot: repo.root,
       settleMs: turnSettleMs,
@@ -440,7 +425,7 @@ export default function (hunk: HunkExtensionAPI) {
       onTurnStart: () => void onTurnStart(repo).catch((error: unknown) => report("turn start", error)),
       onTurnEnd: () => void onTurnEnd(repo).catch((error: unknown) => report("turn end", error)),
     });
-    watcher.start();
+    state.watcher.start();
   }
 
   function report(what: string, error: unknown) {
@@ -456,22 +441,20 @@ export default function (hunk: HunkExtensionAPI) {
       return;
     }
     await withBusy(state.host, async () => {
-      const fresh = await resolveRepo(repo.root);
-      const checkpoint = await markCheckpoint(fresh, { ifChanged: true });
-      await refreshCheckpoint(repo.root);
+      const checkpoint = await markBaseline(repo, state.baseline?.sha);
       if (checkpoint) state.host?.notify(`Agent started — baseline ${short(checkpoint.sha)} is what you just reviewed`);
     });
   }
 
-  /** The agent finished: show what it changed since the baseline. */
+  /** The agent finished: show what it changed since the base on screen. */
   async function onTurnEnd(repo: GitRepo) {
-    if (!state.mode || !state.host) {
-      debug(`turn end ignored (mode=${state.mode})`);
+    if (!state.mode || !state.host || state.view.kind === "other") {
+      debug(`turn end ignored (mode=${state.mode} view=${state.view.kind})`);
       return;
     }
     const host = state.host;
-    const checkpoint = await refreshCheckpoint(repo.root);
-    if (!checkpoint) {
+    const base = roundBase();
+    if (!base) {
       host.notify(
         manual
           ? `Agent finished — no baseline yet; press ${KEYS.mark} after reviewing`
@@ -480,13 +463,12 @@ export default function (hunk: HunkExtensionAPI) {
       );
       return;
     }
-    if (state.view.kind !== "working-tree" && state.view.kind !== "since-checkpoint") return;
-    const shown = await withBusy(host, () => showSinceCheckpoint(repo, checkpoint.sha, { evenIfEmpty: state.view.kind === "since-checkpoint" }));
-    if (shown === undefined) return;
+    const outcome = await showRound(host, repo, base);
+    if (outcome === "busy") return;
     host.notify(
-      shown
-        ? `Agent finished — showing changes since ${short(checkpoint.sha)} (${KEYS.toggle} for the full diff)`
-        : `Agent finished — nothing changed since baseline ${short(checkpoint.sha)}`,
+      outcome === "shown"
+        ? `Agent finished — showing changes since ${short(base)} (${KEYS.toggle} for the full diff)`
+        : `Agent finished — nothing changed since baseline ${short(base)}`,
     );
   }
 
@@ -498,14 +480,14 @@ export default function (hunk: HunkExtensionAPI) {
     debug(`reconcile "${changeset.title}" busy=${state.busy}`);
     adoptHost(ctx);
     try {
-      await refreshCheckpoint(ctx.cwd);
-      state.view = deriveMode(changeset, state.known);
+      const repo = await refreshRounds(ctx.cwd);
+      state.view = deriveMode(changeset, state.rounds.map((round) => round.sha));
       publishStatus();
       ensureWatcher();
-      if (state.view.kind === "since-checkpoint") startPolling();
-      else stopPolling();
-      if (!manual && !herdrEnabled && !warnedAboutAutomatic) {
-        warnedAboutAutomatic = true;
+      if (state.view.kind === "since-checkpoint") poller?.start(repo);
+      else poller?.stop();
+      if (!manual && !herdrEnabled && !state.warnedAboutAutomatic) {
+        state.warnedAboutAutomatic = true;
         ctx.notify(
           "hunk-checkpoint: automatic baselines need herdr; set manual_checkpoints = true or press C to mark them yourself",
           "warning",
@@ -513,7 +495,7 @@ export default function (hunk: HunkExtensionAPI) {
       }
     } catch (error) {
       hunk.log(`reconcile skipped: ${String(error)}`);
-      stopPolling();
+      poller?.stop();
     }
   }
 
@@ -522,15 +504,16 @@ export default function (hunk: HunkExtensionAPI) {
   hunk.on("session_reload", ({ changeset }, ctx) => reconcile(ctx, changeset));
   hunk.on("command_executed", ({ commandId, canonicalCommandId }, ctx) => {
     debug(`command_executed ${commandId} (${canonicalCommandId ?? "-"}) view=${state.view.kind} busy=${state.busy}`);
-    // `r` in checkpoint mode shows the delta since the baseline; Hunk's own
-    // refresh runs too, which is harmless (reloads are coalesced).
+    // `r` in checkpoint mode shows the delta since the base; Hunk's own
+    // refresh runs too, which is harmless (reloads are coalesced). Outside
+    // the mode, or while a snapshot is already running, only Hunk's runs.
     const id = canonicalCommandId ?? commandId;
     if (id !== "hunk.app.refresh" || !state.mode || state.busy) return;
-    return refreshSince(ctx, ctx.cwd).then(() => undefined);
+    return refreshSince(ctx, ctx.cwd);
   });
   hunk.on("shutdown", () => {
-    stopPolling();
-    watcher?.stop();
-    watcher = null;
+    poller?.stop();
+    state.watcher?.stop();
+    state.watcher = null;
   });
 }

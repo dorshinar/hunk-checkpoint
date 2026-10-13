@@ -70,6 +70,11 @@ export class TurnTracker {
   /** Whether the worktree worked since its last rest. */
   private worked = false;
 
+  /** Work was seen since the last rest, so a rest now would end a turn. */
+  get inTurn() {
+    return this.worked;
+  }
+
   observe(state: WorktreeState): TurnTransition {
     const transition = {
       started: state === "working" && this.prevResting,
@@ -222,6 +227,10 @@ export interface TurnWatcherOptions {
  * One live `events.subscribe` connection carries the membership events plus
  * a status subscription per member pane. When membership changes, the roster
  * is read again and the subscription replaced.
+ *
+ * The tracker only ever sees settled states: a rest that follows work is held
+ * back for `settleMs`, and dropped if work resumes meanwhile, so an idle blip
+ * neither ends the turn nor starts a new one.
  */
 export class HerdrTurnWatcher {
   private readonly options: Required<Pick<TurnWatcherOptions, "settleMs" | "backoffMs">> & TurnWatcherOptions;
@@ -233,8 +242,6 @@ export class HerdrTurnWatcher {
   private endTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private backoff: number;
-  /** A turn is in progress: a start was reported, or work was first seen mid-turn. */
-  private inTurn = false;
 
   constructor(options: TurnWatcherOptions) {
     this.options = { settleMs: 1500, backoffMs: { min: 1000, max: 30000 }, ...options };
@@ -249,9 +256,8 @@ export class HerdrTurnWatcher {
   stop() {
     this.stopped = true;
     this.generation += 1;
-    if (this.endTimer) clearTimeout(this.endTimer);
+    this.cancelSettle();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.endTimer = null;
     this.reconnectTimer = null;
     this.connection?.destroy();
     this.connection = null;
@@ -388,29 +394,36 @@ export class HerdrTurnWatcher {
 
   private observe() {
     const state = foldState([...this.members.values()].map((agent) => agent.status));
-    const transition = this.tracker.observe(state);
-    const wasInTurn = this.inTurn;
-    if (state === "working") {
-      this.inTurn = true;
-      // Work resumed inside the settle window: the rest was a blip, not an end.
-      if (this.endTimer) clearTimeout(this.endTimer);
-      this.endTimer = null;
+    if (state === "resting" && this.tracker.inTurn) {
+      // Rest after work must last before it counts; the first resting sample starts the clock.
+      if (!this.endTimer) {
+        this.endTimer = setTimeout(() => {
+          this.endTimer = null;
+          if (!this.stopped) this.settle("resting");
+        }, this.options.settleMs);
+        this.endTimer.unref?.();
+      }
+      return;
     }
-    if (transition.started && !wasInTurn) {
+    this.cancelSettle();
+    this.settle(state);
+  }
+
+  private cancelSettle() {
+    if (this.endTimer) clearTimeout(this.endTimer);
+    this.endTimer = null;
+  }
+
+  /** Feed one settled state to the tracker and report its edges. */
+  private settle(state: WorktreeState) {
+    const { started, ended } = this.tracker.observe(state);
+    if (started) {
       this.log("turn started");
       this.options.onTurnStart?.();
     }
-    if (transition.ended) {
-      if (this.endTimer) clearTimeout(this.endTimer);
-      this.endTimer = setTimeout(() => {
-        this.endTimer = null;
-        if (this.stopped) return;
-        if (foldState([...this.members.values()].map((agent) => agent.status)) !== "resting") return;
-        this.inTurn = false;
-        this.log("turn ended");
-        this.options.onTurnEnd?.();
-      }, this.options.settleMs);
-      this.endTimer.unref?.();
+    if (ended) {
+      this.log("turn ended");
+      this.options.onTurnEnd?.();
     }
   }
 }

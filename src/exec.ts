@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 
+/** Every field accepts `undefined`, so callers can pass optional values straight through. */
 export interface RunOptions {
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-  signal?: AbortSignal;
+  cwd?: string | undefined;
+  env?: NodeJS.ProcessEnv | undefined;
+  signal?: AbortSignal | undefined;
   /** Bytes of stdout to buffer before failing; large diffs need headroom. */
-  maxBuffer?: number;
+  maxBuffer?: number | undefined;
 }
 
 export interface RunResult {

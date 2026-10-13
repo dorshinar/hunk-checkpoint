@@ -26,11 +26,15 @@ const SNAPSHOT_IDENTITY = {
   GIT_COMMITTER_EMAIL: "hunk-checkpoint@localhost",
 };
 
+/** A worktree's stable identity; HEAD and the branch are read when a snapshot needs them. */
 export interface GitRepo {
   /** Absolute working tree root. */
   root: string;
   /** Absolute per-worktree git directory (holds the index and `refs/worktree/`). */
   gitDir: string;
+}
+
+export interface HeadInfo {
   /** Current HEAD commit, or null on an unborn branch. */
   head: string | null;
   /** Short branch name, or null when HEAD is detached. */
@@ -56,45 +60,41 @@ export class NotARepositoryError extends Error {
   }
 }
 
-function git(repo: Pick<GitRepo, "root">, args: readonly string[], options: GitOptions & { env?: NodeJS.ProcessEnv } = {}) {
-  return runOk("git", args, {
-    cwd: repo.root,
-    ...(options.env ? { env: options.env } : {}),
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
+type GitRunOptions = GitOptions & { env?: NodeJS.ProcessEnv | undefined };
+
+/** Run git in the worktree; rejects with `CommandError` on a non-zero exit. */
+function git(repo: Pick<GitRepo, "root">, args: readonly string[], options: GitRunOptions = {}) {
+  return runOk("git", args, { cwd: repo.root, env: options.env, signal: options.signal });
+}
+
+/** Run git in the worktree and resolve its trimmed stdout, or null on a non-zero exit. */
+async function gitMaybe(repo: Pick<GitRepo, "root">, args: readonly string[], options: GitRunOptions = {}) {
+  const result = await run("git", args, { cwd: repo.root, env: options.env, signal: options.signal });
+  return result.code === 0 ? result.stdout.trim() : null;
 }
 
 /** Resolve the Git working tree that contains `cwd`. */
 export async function resolveRepo(cwd: string, options: GitOptions = {}): Promise<GitRepo> {
-  const probe = await run("git", ["rev-parse", "--show-toplevel", "--absolute-git-dir"], {
-    cwd,
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  if (probe.code !== 0) {
-    throw new NotARepositoryError(cwd);
-  }
-  const [rootLine, gitDirLine] = probe.stdout.split("\n");
+  const probe = await gitMaybe({ root: cwd }, ["rev-parse", "--show-toplevel", "--absolute-git-dir"], options);
+  const [rootLine, gitDirLine] = probe?.split("\n") ?? [];
   if (!rootLine || !gitDirLine) {
     throw new NotARepositoryError(cwd);
   }
-  const repo = { root: resolve(rootLine.trim()), gitDir: resolve(gitDirLine.trim()) };
+  return { root: resolve(rootLine.trim()), gitDir: resolve(gitDirLine.trim()) };
+}
 
-  const head = await run("git", ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo.root });
-  const branch = await run("git", ["symbolic-ref", "-q", "--short", "HEAD"], { cwd: repo.root });
-  return {
-    ...repo,
-    head: head.code === 0 ? head.stdout.trim() : null,
-    branch: branch.code === 0 ? branch.stdout.trim() : null,
-  };
+/** Where the worktree stands right now: HEAD (null when unborn) and the branch (null when detached). */
+export async function readHead(repo: GitRepo, options: GitOptions = {}): Promise<HeadInfo> {
+  const [head, branch] = await Promise.all([
+    gitMaybe(repo, ["rev-parse", "--verify", "-q", "HEAD"], options),
+    gitMaybe(repo, ["symbolic-ref", "-q", "--short", "HEAD"], options),
+  ]);
+  return { head, branch };
 }
 
 /** Resolve one ref to a commit sha, or null when it does not exist. */
-async function resolveRef(repo: GitRepo, ref: string, options: GitOptions = {}) {
-  const result = await run("git", ["rev-parse", "--verify", "-q", `${ref}^{commit}`], {
-    cwd: repo.root,
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  return result.code === 0 ? result.stdout.trim() : null;
+function resolveRef(repo: GitRepo, ref: string, options: GitOptions = {}) {
+  return gitMaybe(repo, ["rev-parse", "--verify", "-q", `${ref}^{commit}`], options);
 }
 
 async function describeCommit(repo: GitRepo, sha: string, options: GitOptions = {}): Promise<Checkpoint> {
@@ -118,11 +118,8 @@ export async function readCheckpoint(repo: GitRepo, options: GitOptions = {}) {
 export async function listCheckpoints(repo: GitRepo, options: GitOptions = {}): Promise<Checkpoint[]> {
   const current = await resolveRef(repo, CHECKPOINT_REF, options);
   if (!current) return [];
-  const result = await run("git", ["log", "-g", "--format=%H%x1f%ct%x1f%s", CHECKPOINT_REF], {
-    cwd: repo.root,
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  const entries = result.code === 0 ? parseLogEntries(result.stdout) : [];
+  const log = await gitMaybe(repo, ["log", "-g", "--format=%H%x1f%ct%x1f%s", CHECKPOINT_REF], options);
+  const entries = parseLogEntries(log ?? "");
   const seen = new Set<string>();
   const unique = entries.filter((entry) => !seen.has(entry.sha) && seen.add(entry.sha));
   return unique.length > 0 ? unique : [await describeCommit(repo, current, options)];
@@ -185,9 +182,9 @@ async function commitTree(
 
 export interface MarkOptions extends GitOptions {
   /** Free-text note recorded in the checkpoint commit body. */
-  note?: string;
-  /** Skip (resolve null) when the working tree equals the current checkpoint. */
-  ifChanged?: boolean;
+  note?: string | undefined;
+  /** Skip (resolve null) when the working tree's tree equals this commit's tree. */
+  skipIfSameAs?: string | undefined;
 }
 
 /**
@@ -198,21 +195,24 @@ export interface MarkOptions extends GitOptions {
  * changed in this round". Returns the new checkpoint.
  */
 export async function markCheckpoint(repo: GitRepo, options: MarkOptions = {}): Promise<Checkpoint | null> {
-  const previous = await resolveRef(repo, CHECKPOINT_REF, options);
+  const [previous, { head, branch: branchName }] = await Promise.all([
+    resolveRef(repo, CHECKPOINT_REF, options),
+    readHead(repo, options),
+  ]);
   const tree = await writeWorkingTree(repo, options);
-  if (options.ifChanged && previous && (await treeOf(repo, previous, options)) === tree) {
+  if (options.skipIfSameAs && (await treeOf(repo, options.skipIfSameAs, options)) === tree) {
     return null;
   }
   const round = previous ? (await listCheckpoints(repo, options)).length + 1 : 1;
-  const parent = previous ?? repo.head;
-  const branch = repo.branch ?? "detached HEAD";
+  const parent = previous ?? head;
+  const branch = branchName ?? "detached HEAD";
   const body = [
     `hunk-checkpoint: review round ${round} on ${branch}`,
     "",
     options.note?.trim() ? `${options.note.trim()}\n` : "",
     `Hunk-Checkpoint-Round: ${round}`,
     `Hunk-Checkpoint-Branch: ${branch}`,
-    `Hunk-Checkpoint-Head: ${repo.head ?? "unborn"}`,
+    `Hunk-Checkpoint-Head: ${head ?? "unborn"}`,
   ]
     .filter((line, index, lines) => !(line === "" && lines[index - 1] === ""))
     .join("\n");
@@ -249,9 +249,8 @@ export async function snapshotLive(repo: GitRepo, checkpointSha: string, options
 
 /** Forget every checkpoint for this worktree. */
 export async function clearCheckpoints(repo: GitRepo, options: GitOptions = {}) {
-  const runOptions = { cwd: repo.root, ...(options.signal ? { signal: options.signal } : {}) };
-  await run("git", ["update-ref", "-d", CHECKPOINT_REF], runOptions);
-  await run("git", ["update-ref", "-d", LIVE_REF], runOptions);
+  await gitMaybe(repo, ["update-ref", "-d", CHECKPOINT_REF], options);
+  await gitMaybe(repo, ["update-ref", "-d", LIVE_REF], options);
 }
 
 /** One-line `files changed, insertions, deletions` summary between two commits. */

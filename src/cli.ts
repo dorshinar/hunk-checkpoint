@@ -1,7 +1,5 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { HunkExtensionUserError, type ExtensionCliCommandHandler } from "hunkdiff/extension";
+import type { BuildStamp } from "./build.ts";
 import {
   clearCheckpoints,
   listCheckpoints,
@@ -135,7 +133,7 @@ async function requireSession(repo: GitRepo, explicitId: string | undefined, sig
   return session;
 }
 
-export function createCliHandler(): ExtensionCliCommandHandler {
+export function createCliHandler(build: BuildStamp): ExtensionCliCommandHandler {
   return async (args, ctx) => {
     const { command, flags } = parseArgs(args);
     // A reader that hangs up early (`| head`) is not an error worth a stack trace.
@@ -160,11 +158,8 @@ export function createCliHandler(): ExtensionCliCommandHandler {
         const repo = await requireRepo(ctx.cwd, ctx.signal);
         const note = flagValue(flags, "-m", "--message");
         await ctx.stderr.write("Snapshotting working tree…\n");
-        const checkpoint = await markCheckpoint(repo, {
-          signal: ctx.signal,
-          ifChanged: flags.has("--if-changed"),
-          ...(note ? { note } : {}),
-        });
+        const current = flags.has("--if-changed") ? await readCheckpoint(repo, { signal: ctx.signal }) : null;
+        const checkpoint = await markCheckpoint(repo, { signal: ctx.signal, skipIfSameAs: current?.sha, note });
         if (!checkpoint) {
           await out(json ? "null" : "Working tree unchanged since the current checkpoint; nothing marked.");
           return { kind: "exit" };
@@ -237,14 +232,7 @@ export function createCliHandler(): ExtensionCliCommandHandler {
       }
 
       case "version": {
-        const source = fileURLToPath(import.meta.url);
-        let version = "?";
-        try {
-          version = String((JSON.parse(readFileSync(join(dirname(source), "..", "package.json"), "utf8")) as { version?: string }).version ?? "?");
-        } catch {
-          // No manifest beside a single-file install.
-        }
-        await out(`hunk-checkpoint ${version} (${source})`);
+        await out(`hunk-checkpoint ${build.version} (${build.source})`);
         return { kind: "exit" };
       }
 

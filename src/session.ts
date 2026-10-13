@@ -27,9 +27,7 @@ function hunkBinary() {
 }
 
 export async function listSessions(signal?: AbortSignal): Promise<LiveSession[]> {
-  const result = await run(hunkBinary(), ["session", "list", "--json"], {
-    ...(signal ? { signal } : {}),
-  });
+  const result = await run(hunkBinary(), ["session", "list", "--json"], { signal });
   if (result.code !== 0) {
     const detail = result.stderr.trim() || result.stdout.trim();
     if (/no active hunk sessions/i.test(detail)) return [];
@@ -100,7 +98,5 @@ export function reviewArgs(target: ReviewTarget): string[] {
 
 /** Swap one live session's contents. */
 export async function reloadSession(sessionId: string, target: ReviewTarget, signal?: AbortSignal) {
-  await runOk(hunkBinary(), ["session", "reload", sessionId, "--json", "--", ...reviewArgs(target)], {
-    ...(signal ? { signal } : {}),
-  });
+  await runOk(hunkBinary(), ["session", "reload", sessionId, "--json", "--", ...reviewArgs(target)], { signal });
 }

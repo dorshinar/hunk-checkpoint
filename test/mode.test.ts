@@ -40,7 +40,7 @@ describe("view mode detection", () => {
     const full = { kind: "working-tree" } as const;
     const since = { kind: "since-checkpoint", base: CKPT, head: "f" } as const;
     assert.match(text(statusSpans({ checkpoint: null, view: full, mode: false, manual: false, busy: false, keys })), /off · x on/);
-    assert.match(text(statusSpans({ checkpoint, view: full, mode: false, manual: false, busy: false, keys })), /off · x since 8b10a5d/);
+    assert.match(text(statusSpans({ checkpoint, view: full, mode: false, manual: false, busy: false, keys })), /off · base 8b10a5d · x on/);
     assert.match(text(statusSpans({ checkpoint: null, view: full, mode: true, manual: false, busy: false, keys })), /on · baseline at the next agent turn/);
     assert.match(text(statusSpans({ checkpoint: null, view: full, mode: true, manual: true, busy: false, keys })), /on · C sets the baseline/);
     assert.match(text(statusSpans({ checkpoint, view: full, mode: true, manual: false, busy: false, keys })), /base 8b10a5d .* full diff/);

@@ -43,6 +43,7 @@ export function formatAge(createdAtSeconds: number, nowMs = Date.now()) {
 }
 
 export interface StatusInput {
+  /** This window's baseline: the last round snapshotted here. */
   checkpoint: Checkpoint | null;
   /** What the mounted review compares. */
   view: ViewMode;
@@ -66,7 +67,7 @@ export function statusSpans({ checkpoint, view, mode, manual, busy, keys, nowMs 
     return [
       label,
       muted("off"),
-      muted(checkpoint ? ` · ${keys.toggle} since ${short(checkpoint.sha)}` : ` · ${keys.toggle} on`),
+      muted(checkpoint ? ` · base ${short(checkpoint.sha)} · ${keys.toggle} on` : ` · ${keys.toggle} on`),
     ];
   }
   if (!checkpoint) {
