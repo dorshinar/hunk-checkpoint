@@ -148,7 +148,7 @@ export function createCliHandler(build: BuildStamp): ExtensionCliCommandHandler 
       }
     };
     if (!command || flags.has("--help") || flags.has("-h")) {
-      await ctx.stdout.write(HELP);
+      await out(HELP);
       return { kind: "exit" };
     }
     const json = flags.has("--json");

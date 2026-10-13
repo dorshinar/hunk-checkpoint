@@ -69,7 +69,7 @@ describe("checkpoint plumbing", () => {
     write(root, "fresh.txt", "new file\n");
     write(root, "ignored.log", "noise\n");
 
-    const checkpoint = (await markCheckpoint(repo, { note: "first pass" }))!;
+    const checkpoint = await markCheckpoint(repo, { note: "first pass" });
 
     assert.equal(sh(root, "rev-parse", CHECKPOINT_REF), checkpoint.sha);
     assert.equal(sh(root, "rev-parse", `${checkpoint.sha}^`), head, "first checkpoint parents HEAD");
@@ -105,7 +105,7 @@ describe("checkpoint plumbing", () => {
   it("chains rounds through the checkpoint reflog", async () => {
     const repo = await resolveRepo(root);
     const first = (await readCheckpoint(repo))!;
-    const second = (await markCheckpoint(repo))!;
+    const second = await markCheckpoint(repo);
 
     assert.notEqual(second.sha, first.sha);
     assert.equal(sh(root, "rev-parse", `${second.sha}^`), first.sha, "later checkpoints parent the previous one");
@@ -117,11 +117,13 @@ describe("checkpoint plumbing", () => {
     assert.match(second.subject, /round 2 on main/);
   });
 
-  it("skips marking when the tree equals the given round", async () => {
+  it("skips marking or snapshotting when the tree equals the given round", async () => {
     const repo = await resolveRepo(root);
     const current = (await readCheckpoint(repo))!;
     assert.equal(await markCheckpoint(repo, { skipIfSameAs: current.sha }), null);
     assert.equal((await readCheckpoint(repo))!.sha, current.sha);
+    assert.equal(await snapshotLive(repo, current.sha, { skipIfSameAs: current.sha }), null);
+    assert.ok(await snapshotLive(repo, current.sha, { skipIfSameAs: undefined }), "nothing to compare with: always snapshots");
   });
 
   it("produces identical trees for identical working trees", async () => {
@@ -144,7 +146,7 @@ describe("checkpoint plumbing", () => {
     sh(root, "worktree", "add", "-q", linked, "-b", "linked");
     const repo = await resolveRepo(linked);
     assert.equal(await readCheckpoint(repo), null, "a linked worktree starts with its own empty checkpoint");
-    const checkpoint = (await markCheckpoint(repo))!;
+    const checkpoint = await markCheckpoint(repo);
     assert.equal(sh(linked, "rev-parse", CHECKPOINT_REF), checkpoint.sha);
     assert.notEqual(sh(root, "rev-parse", CHECKPOINT_REF), checkpoint.sha);
   });

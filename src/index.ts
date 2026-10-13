@@ -7,18 +7,9 @@ import type {
 } from "hunkdiff/extension";
 import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
-import {
-  listCheckpoints,
-  markCheckpoint,
-  resolveRepo,
-  short,
-  snapshotLive,
-  treeOf,
-  type Checkpoint,
-  type GitRepo,
-} from "./git.ts";
+import { listCheckpoints, markCheckpoint, resolveRepo, short, snapshotLive, type Checkpoint, type GitRepo } from "./git.ts";
 import { HerdrTurnWatcher, herdrSocketPath } from "./herdr.ts";
-import { deriveMode, formatAge, statusSpans, type ViewMode } from "./mode.ts";
+import { deriveView, formatAge, statusSpans, type CheckpointMode, type ViewMode } from "./mode.ts";
 import { WorkingTreePoller } from "./poll.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
 
@@ -28,7 +19,7 @@ import { listSessions, reloadSession, selectSession, type LiveSession, type Revi
  * The flow this is built around:
  *
  * 1. The agent changes things; you review the working tree in Hunk.
- * 2. You press `x`: checkpoint mode is on for this worktree. With no baseline
+ * 2. You press `x`: checkpoint mode is on for this window. With no baseline
  *    yet, the review stays on the full diff against HEAD.
  * 3. You leave notes and prompt the agent to address them.
  * 4. Inside herdr, the extension notices the agent starting its turn and
@@ -62,17 +53,18 @@ interface ReviewHost {
 interface State {
   repo: GitRepo | null;
   /**
-   * This window's baseline: the last round snapshotted *here* (`C`, a turn
-   * start, or `r` in manual mode). Rounds stored by earlier windows stay in
-   * the worktree and are reachable through `X`, but are never assumed.
+   * Checkpoint mode for this window; every launch starts with it off. When
+   * on, it carries the window's baseline: the last round snapshotted here
+   * (`C`, a turn start, `r` in manual mode, a round picked with `X`), or the
+   * base of a since view an agent mounted here with `hunk checkpoint sync`.
+   * Rounds stored by earlier windows stay in the worktree for `X`, but are
+   * never assumed.
    */
-  baseline: Checkpoint | null;
+  mode: CheckpointMode;
   /** Every round stored for this worktree, newest first (for `X` and title matching). */
   rounds: Checkpoint[];
   /** What the mounted review compares, read from its title. */
   view: ViewMode;
-  /** Checkpoint mode, toggled with `x`; every launch starts with it off. */
-  mode: boolean;
   busy: boolean;
   session: LiveSession | null;
   /** Controls from the newest review generation; older handles go inert on reload. */
@@ -82,24 +74,22 @@ interface State {
 }
 
 /** What showing a round did: reloaded the review, left it alone (nothing changed), or could not run. */
-type RoundOutcome = "shown" | "empty" | "busy";
+type RoundOutcome = { kind: "shown"; to: string } | { kind: "empty" } | { kind: "busy" };
 
 export default function (hunk: HunkExtensionAPI) {
-  const herdrSocket = herdrSocketPath();
-  const herdrEnabled = hunk.config.herdr !== false && herdrSocket !== null;
+  const herdrSocket = hunk.config.herdr !== false ? herdrSocketPath() : null;
   /** Checkpoints are marked by hand unless herdr can mark them at each agent turn. */
   const manual =
-    typeof hunk.config.manual_checkpoints === "boolean" ? hunk.config.manual_checkpoints : !herdrEnabled;
+    typeof hunk.config.manual_checkpoints === "boolean" ? hunk.config.manual_checkpoints : herdrSocket === null;
   const showStatus = hunk.config.status_line !== false;
   const autoRefreshSeconds = Number(hunk.config.auto_refresh_seconds ?? 0);
   const turnSettleMs = Number(hunk.config.turn_settle_ms ?? 1500);
 
   const state: State = {
     repo: null,
-    baseline: null,
+    mode: { kind: "off" },
     rounds: [],
     view: { kind: "working-tree" },
-    mode: false,
     busy: false,
     session: null,
     host: null,
@@ -123,27 +113,21 @@ export default function (hunk: HunkExtensionAPI) {
     return repo;
   }
 
+  /** The window's baseline, when checkpoint mode has one. */
+  function baseline() {
+    return state.mode.kind === "on" ? state.mode.baseline : null;
+  }
+
   /** Snapshot the working tree as a new round and make it the baseline; null when its tree equals `skipIfSameAs`. */
+  function markBaseline(repo: GitRepo): Promise<Checkpoint>;
+  function markBaseline(repo: GitRepo, skipIfSameAs: string | undefined): Promise<Checkpoint | null>;
   async function markBaseline(repo: GitRepo, skipIfSameAs?: string) {
     const next = await markCheckpoint(repo, { skipIfSameAs });
-    await refreshRounds(repo.root);
-    if (next) state.baseline = next;
+    if (next) {
+      state.mode = { kind: "on", baseline: next };
+      state.rounds = [next, ...state.rounds];
+    }
     return next;
-  }
-
-  /** Expand a short sha from a review title back to the full round id when known. */
-  function expandSha(prefix: string) {
-    return state.rounds.find((round) => round.sha.startsWith(prefix))?.sha ?? prefix;
-  }
-
-  /**
-   * What a round refresh compares against: the base of the since-view on
-   * screen when there is one (it may have been mounted by `X` or by an agent's
-   * `hunk checkpoint sync`), otherwise this window's baseline.
-   */
-  function roundBase() {
-    if (state.view.kind === "since-checkpoint") return expandSha(state.view.base);
-    return state.baseline?.sha ?? null;
   }
 
   function publishStatus(fallback?: ExtensionStatusLineControls) {
@@ -152,7 +136,7 @@ export default function (hunk: HunkExtensionAPI) {
     // prefer the handle the latest lifecycle event delivered.
     const statusLine = state.host?.statusLine ?? fallback;
     if (!statusLine) return;
-    if (!state.mode && !state.busy && !state.baseline) {
+    if (state.mode.kind === "off" && !state.busy) {
       statusLine.clear(STATUS_ITEM);
       return;
     }
@@ -160,14 +144,7 @@ export default function (hunk: HunkExtensionAPI) {
       id: STATUS_ITEM,
       alignment: "right",
       priority: 5,
-      spans: statusSpans({
-        checkpoint: state.baseline,
-        view: state.view,
-        mode: state.mode,
-        manual,
-        busy: state.busy,
-        keys: KEYS,
-      }),
+      spans: statusSpans({ mode: state.mode, view: state.view, manual, busy: state.busy, keys: KEYS }),
     });
   }
 
@@ -226,21 +203,24 @@ export default function (hunk: HunkExtensionAPI) {
   }
 
   /**
-   * Snapshot the working tree and point the session at `base..snapshot`.
+   * Snapshot the working tree and point the session at `base..snapshot`. With
+   * `close`, the snapshot is recorded as the next round and becomes the
+   * baseline (the manual turn boundary).
    *
-   * A mounted since-view is always refreshed. Any other view is left alone
-   * when nothing changed since `base`, so the full diff does not give way to
-   * an empty round.
+   * A round is never recorded twice, and the full diff never gives way to an
+   * empty round; only a mounted since view is refreshed when nothing changed.
    */
-  async function showRound(host: ReviewHost, repo: GitRepo, base: string): Promise<RoundOutcome> {
-    const keepIfEmpty = state.view.kind !== "since-checkpoint";
+  async function showRound(host: ReviewHost, repo: GitRepo, base: string, { close = false } = {}): Promise<RoundOutcome> {
+    const refreshEmpty = state.view.kind === "since-checkpoint" && !close;
     const outcome = await withBusy(host, async (): Promise<RoundOutcome> => {
-      const live = await snapshotLive(repo, base);
-      if (keepIfEmpty && (await treeOf(repo, live)) === (await treeOf(repo, base))) return "empty";
-      await reload(repo, { kind: "range", from: base, to: live });
-      return "shown";
+      const to = close
+        ? (await markBaseline(repo, base))?.sha
+        : await snapshotLive(repo, base, { skipIfSameAs: refreshEmpty ? undefined : base });
+      if (!to) return { kind: "empty" };
+      await reload(repo, { kind: "range", from: base, to });
+      return { kind: "shown", to };
     });
-    return outcome ?? "busy";
+    return outcome ?? { kind: "busy" };
   }
 
   /** Opt-in: keep a mounted since-view current while the tree moves (for setups without herdr). */
@@ -250,9 +230,9 @@ export default function (hunk: HunkExtensionAPI) {
           intervalMs: autoRefreshSeconds * 1000,
           log: debug,
           onChange: async () => {
-            const base = roundBase();
+            const base = baseline();
             if (!state.repo || !state.host || !base) return;
-            await showRound(state.host, state.repo, base);
+            await showRound(state.host, state.repo, base.sha);
           },
         })
       : null;
@@ -265,11 +245,10 @@ export default function (hunk: HunkExtensionAPI) {
     { id: "toggle", title: "Checkpoint mode: toggle on/off", key: KEYS.toggle },
     async (ctx) => {
       const repo = await refreshRounds(ctx.cwd);
-      if (state.mode) {
+      if (state.mode.kind !== "off") {
         // Off: this window's baseline is forgotten; the stored rounds stay
         // in the worktree for `X`.
-        state.mode = false;
-        state.baseline = null;
+        state.mode = { kind: "off" };
         publishStatus(ctx.statusLine);
         if (state.view.kind === "since-checkpoint") {
           await withBusy(ctx, () => reload(repo, { kind: "working-tree" }));
@@ -277,17 +256,16 @@ export default function (hunk: HunkExtensionAPI) {
         ctx.notify("Checkpoint mode off — showing the full diff");
         return;
       }
-      // On: a baseline marked with `C` while off is kept; otherwise the full
-      // diff stays on screen until a round closes (turn end in herdr, `r` by
-      // hand). Rounds from earlier windows are never assumed; `X` offers them.
-      state.mode = true;
+      // On: the full diff stays on screen until a round closes (turn end in
+      // herdr, `r` by hand). Rounds from earlier windows are never assumed;
+      // `X` offers them.
+      state.mode = { kind: "armed" };
       publishStatus(ctx.statusLine);
-      const baseline = state.baseline ? `baseline ${short(state.baseline.sha)} is set, ` : "";
       const earlier = state.rounds.length > 0 ? ` · ${KEYS.pick} compares with ${state.rounds.length} stored round(s)` : "";
       ctx.notify(
         manual
-          ? `Checkpoint mode on [${BUILD.short}] — ${baseline || `${KEYS.mark} sets the baseline, `}r closes a round and shows it against the previous one${earlier}`
-          : `Checkpoint mode on [${BUILD.short}] — ${baseline}each agent turn is snapshotted when it starts and shown when it ends${earlier}`,
+          ? `Checkpoint mode on [${BUILD.short}] — ${KEYS.mark} sets the baseline, r closes a round and shows it against the previous one${earlier}`
+          : `Checkpoint mode on [${BUILD.short}] — each agent turn is snapshotted when it starts and shown when it ends${earlier}`,
       );
     },
   );
@@ -296,9 +274,10 @@ export default function (hunk: HunkExtensionAPI) {
     { id: "mark", title: "Checkpoint: set the baseline now", key: KEYS.mark },
     async (ctx) => {
       const repo = await ensureRepo(ctx.cwd);
+      const wasOff = state.mode.kind === "off";
       await withBusy(ctx, async () => {
-        const checkpoint = (await markBaseline(repo))!;
-        ctx.notify(`Baseline ${short(checkpoint.sha)} saved${state.mode ? "" : ` — press ${KEYS.toggle} to turn checkpoint mode on`}`);
+        const checkpoint = await markBaseline(repo);
+        ctx.notify(`Baseline ${short(checkpoint.sha)} saved${wasOff ? " — checkpoint mode on" : ""}`);
         if (state.view.kind === "since-checkpoint") {
           // The since-view would now be empty; fall back to the full diff.
           await reload(repo, { kind: "working-tree" });
@@ -309,10 +288,10 @@ export default function (hunk: HunkExtensionAPI) {
 
   /**
    * `r` in checkpoint mode. By hand, it is the turn boundary: the working
-   * tree becomes the next round and the review shows it against the base on
-   * screen, so every reload compares this round with the last. Inside herdr
-   * the agent's turn edges do that by themselves, and `r` just refreshes the
-   * current round against its base.
+   * tree becomes the next round and the review shows it against the baseline,
+   * so every reload compares this round with the last. Inside herdr the
+   * agent's turn edges do that by themselves, and `r` just refreshes the
+   * current round against the baseline.
    */
   async function refreshSince(ctx: ReviewHost, cwd: string) {
     const repo = await ensureRepo(cwd);
@@ -320,32 +299,23 @@ export default function (hunk: HunkExtensionAPI) {
       ctx.notify("Rounds refresh the working tree or a since view; this review is neither", "warning");
       return;
     }
-    const base = roundBase();
+    const base = baseline();
     if (!base) {
       ctx.notify(manual ? `No baseline yet — press ${KEYS.mark} first` : "No baseline yet — it is set when the agent starts a turn", "warning");
       return;
     }
-    if (manual) {
-      await withBusy(ctx, async () => {
-        const next = await markBaseline(repo, base);
-        if (!next) {
-          ctx.notify(`Nothing changed since round ${short(base)} yet`);
-          return;
-        }
-        await reload(repo, { kind: "range", from: base, to: next.sha });
-        ctx.notify(`Round ${short(next.sha)} closed — showing it against ${short(base)}`);
-      });
-      return;
-    }
-    if ((await showRound(ctx, repo, base)) === "empty") {
-      ctx.notify(`Nothing changed since baseline ${short(base)} yet`);
+    const outcome = await showRound(ctx, repo, base.sha, { close: manual });
+    if (outcome.kind === "empty") {
+      ctx.notify(`Nothing changed since ${manual ? "round" : "baseline"} ${short(base.sha)} yet`);
+    } else if (outcome.kind === "shown" && manual) {
+      ctx.notify(`Round ${short(outcome.to)} closed — showing it against ${short(base.sha)}`);
     }
   }
 
   hunk.registerCommand(
     { id: "refresh", title: "Checkpoint: close this round and show it against the previous one" },
     async (ctx) => {
-      if (!state.mode) {
+      if (state.mode.kind === "off") {
         ctx.notify(`Checkpoint mode is off — press ${KEYS.toggle} first`, "warning");
         return;
       }
@@ -369,10 +339,11 @@ export default function (hunk: HunkExtensionAPI) {
       if (!chosen) return;
       const target = state.rounds[Number(/^(\d+)\./.exec(chosen)?.[1] ?? 0) - 1];
       if (!target) return;
-      // The picked round is what is on screen from here on, so `r` and turn
-      // ends refresh against it; the window's own baseline is unchanged.
-      state.mode = true;
-      if ((await showRound(ctx, repo, target.sha)) === "empty") {
+      // The picked round is the window's baseline from here on, so `r` and
+      // turn ends refresh against it (until the next turn start replaces it).
+      state.mode = { kind: "on", baseline: target };
+      publishStatus(ctx.statusLine);
+      if ((await showRound(ctx, repo, target.sha)).kind === "empty") {
         ctx.notify(`Nothing changed since round ${short(target.sha)}`);
       }
     },
@@ -380,13 +351,14 @@ export default function (hunk: HunkExtensionAPI) {
 
   hunk.registerCommand({ id: "about", title: "Checkpoint: about this build" }, async (ctx) => {
     const repo = state.repo ? state.repo.root : "(no repository resolved yet)";
+    const base = baseline();
     await ctx.dialogs.confirm({
       title: BUILD.label,
       body: [
         `source: ${BUILD.source}`,
         `extension API: ${hunk.apiVersion}`,
-        `herdr: ${herdrEnabled ? `socket ${herdrSocket}` : "not detected"} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
-        `worktree: ${repo} · checkpoint mode: ${state.mode ? "on" : "off"} · baseline: ${state.baseline ? short(state.baseline.sha) : "none"} · stored rounds: ${state.rounds.length}`,
+        `herdr: ${herdrSocket ? `socket ${herdrSocket}` : "off"} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
+        `worktree: ${repo} · checkpoint mode: ${state.mode.kind}${base ? ` (baseline ${short(base.sha)})` : ""} · stored rounds: ${state.rounds.length}`,
       ].join("\n"),
       confirmLabel: "ok",
       cancelLabel: "close",
@@ -412,7 +384,7 @@ export default function (hunk: HunkExtensionAPI) {
 
   /** Follow the agents of this worktree once the repo is known and herdr is around. */
   function ensureWatcher() {
-    if (state.watcher || !herdrEnabled || !herdrSocket || !state.repo) return;
+    if (state.watcher || !herdrSocket || !state.repo) return;
     const repo = state.repo;
     state.watcher = new HerdrTurnWatcher({
       socket: herdrSocket,
@@ -436,24 +408,24 @@ export default function (hunk: HunkExtensionAPI) {
 
   /** The agent started working: what you were looking at becomes the baseline. */
   async function onTurnStart(repo: GitRepo) {
-    if (manual || !state.mode || !state.host) {
-      debug(`turn start ignored (manual=${manual} mode=${state.mode})`);
+    if (manual || state.mode.kind === "off" || !state.host) {
+      debug(`turn start ignored (manual=${manual} mode=${state.mode.kind})`);
       return;
     }
     await withBusy(state.host, async () => {
-      const checkpoint = await markBaseline(repo, state.baseline?.sha);
+      const checkpoint = await markBaseline(repo, baseline()?.sha);
       if (checkpoint) state.host?.notify(`Agent started — baseline ${short(checkpoint.sha)} is what you just reviewed`);
     });
   }
 
-  /** The agent finished: show what it changed since the base on screen. */
+  /** The agent finished: show what it changed since the baseline. */
   async function onTurnEnd(repo: GitRepo) {
-    if (!state.mode || !state.host || state.view.kind === "other") {
-      debug(`turn end ignored (mode=${state.mode} view=${state.view.kind})`);
+    const host = state.host;
+    if (state.mode.kind === "off" || !host || state.view.kind === "other") {
+      debug(`turn end ignored (mode=${state.mode.kind} view=${state.view.kind})`);
       return;
     }
-    const host = state.host;
-    const base = roundBase();
+    const base = baseline();
     if (!base) {
       host.notify(
         manual
@@ -463,12 +435,12 @@ export default function (hunk: HunkExtensionAPI) {
       );
       return;
     }
-    const outcome = await showRound(host, repo, base);
-    if (outcome === "busy") return;
+    const outcome = await showRound(host, repo, base.sha);
+    if (outcome.kind === "busy") return;
     host.notify(
-      outcome === "shown"
-        ? `Agent finished — showing changes since ${short(base)} (${KEYS.toggle} for the full diff)`
-        : `Agent finished — nothing changed since baseline ${short(base)}`,
+      outcome.kind === "shown"
+        ? `Agent finished — showing changes since ${short(base.sha)} (${KEYS.toggle} for the full diff)`
+        : `Agent finished — nothing changed since baseline ${short(base.sha)}`,
     );
   }
 
@@ -481,12 +453,17 @@ export default function (hunk: HunkExtensionAPI) {
     adoptHost(ctx);
     try {
       const repo = await refreshRounds(ctx.cwd);
-      state.view = deriveMode(changeset, state.rounds.map((round) => round.sha));
+      state.view = deriveView(changeset, state.rounds);
+      // A since view mounted while this window has no baseline (an agent's
+      // `hunk checkpoint sync`) hands it one: its base.
+      if (state.view.kind === "since-checkpoint" && state.mode.kind !== "on") {
+        state.mode = { kind: "on", baseline: state.view.base };
+      }
       publishStatus();
       ensureWatcher();
       if (state.view.kind === "since-checkpoint") poller?.start(repo);
       else poller?.stop();
-      if (!manual && !herdrEnabled && !state.warnedAboutAutomatic) {
+      if (!manual && !herdrSocket && !state.warnedAboutAutomatic) {
         state.warnedAboutAutomatic = true;
         ctx.notify(
           "hunk-checkpoint: automatic baselines need herdr; set manual_checkpoints = true or press C to mark them yourself",
@@ -504,11 +481,11 @@ export default function (hunk: HunkExtensionAPI) {
   hunk.on("session_reload", ({ changeset }, ctx) => reconcile(ctx, changeset));
   hunk.on("command_executed", ({ commandId, canonicalCommandId }, ctx) => {
     debug(`command_executed ${commandId} (${canonicalCommandId ?? "-"}) view=${state.view.kind} busy=${state.busy}`);
-    // `r` in checkpoint mode shows the delta since the base; Hunk's own
+    // `r` in checkpoint mode shows the delta since the baseline; Hunk's own
     // refresh runs too, which is harmless (reloads are coalesced). Outside
     // the mode, or while a snapshot is already running, only Hunk's runs.
     const id = canonicalCommandId ?? commandId;
-    if (id !== "hunk.app.refresh" || !state.mode || state.busy) return;
+    if (id !== "hunk.app.refresh" || state.mode.kind === "off" || state.busy) return;
     return refreshSince(ctx, ctx.cwd);
   });
   hunk.on("shutdown", () => {

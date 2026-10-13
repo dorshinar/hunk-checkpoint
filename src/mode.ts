@@ -4,8 +4,14 @@ import { short, type Checkpoint } from "./git.ts";
 /** What the mounted review is comparing, as far as this extension can tell. */
 export type ViewMode =
   | { kind: "working-tree" }
-  | { kind: "since-checkpoint"; base: string; head: string }
+  | { kind: "since-checkpoint"; base: Checkpoint; head: string }
   | { kind: "other" };
+
+/**
+ * Checkpoint mode for one window. `armed` is on without a baseline yet (the
+ * next `C` or agent turn sets one); `on` carries the window's baseline.
+ */
+export type CheckpointMode = { kind: "off" } | { kind: "armed" } | { kind: "on"; baseline: Checkpoint };
 
 const RANGE_TITLE = /\s([0-9a-f]{7,64})\.\.([0-9a-f]{7,64})$/i;
 
@@ -15,17 +21,12 @@ export function parseRangeTitle(title: string): { base: string; head: string } |
   return match ? { base: match[1]!.toLowerCase(), head: match[2]!.toLowerCase() } : null;
 }
 
-/** Classify one loaded changeset against the checkpoints this worktree knows. */
-export function deriveMode(
-  changeset: { title: string },
-  knownCheckpoints: readonly string[],
-): ViewMode {
+/** Classify one loaded changeset against the rounds this worktree knows. */
+export function deriveView(changeset: { title: string }, rounds: readonly Checkpoint[]): ViewMode {
   const range = parseRangeTitle(changeset.title);
   if (range) {
-    const matches = knownCheckpoints.some(
-      (sha) => sha.startsWith(range.base) || range.base.startsWith(sha),
-    );
-    return matches ? { kind: "since-checkpoint", base: range.base, head: range.head } : { kind: "other" };
+    const base = rounds.find((round) => round.sha.startsWith(range.base) || range.base.startsWith(round.sha));
+    return base ? { kind: "since-checkpoint", base, head: range.head } : { kind: "other" };
   }
   if (/\sworking tree$/.test(changeset.title)) return { kind: "working-tree" };
   return { kind: "other" };
@@ -43,12 +44,9 @@ export function formatAge(createdAtSeconds: number, nowMs = Date.now()) {
 }
 
 export interface StatusInput {
-  /** This window's baseline: the last round snapshotted here. */
-  checkpoint: Checkpoint | null;
+  mode: CheckpointMode;
   /** What the mounted review compares. */
   view: ViewMode;
-  /** Whether checkpoint mode is on for this worktree. */
-  mode: boolean;
   /** Checkpoints are marked by hand (`C`) rather than at each agent turn. */
   manual: boolean;
   busy: boolean;
@@ -57,37 +55,24 @@ export interface StatusInput {
 }
 
 /** The status-row item: checkpoint mode, the baseline, and what the review shows. */
-export function statusSpans({ checkpoint, view, mode, manual, busy, keys, nowMs }: StatusInput): ExtensionStatusSpan[] {
+export function statusSpans({ mode, view, manual, busy, keys, nowMs }: StatusInput): ExtensionStatusSpan[] {
   const label: ExtensionStatusSpan = { text: "ckpt ", tone: "muted" };
+  const on: ExtensionStatusSpan = { text: "on", tone: "accent" };
   const muted = (text: string): ExtensionStatusSpan => ({ text, tone: "muted" });
-  if (busy) {
-    return [label, { text: "snapshotting…", tone: "accent" }];
+  if (busy) return [label, { text: "snapshotting…", tone: "accent" }];
+  switch (mode.kind) {
+    case "off":
+      return [label, muted("off"), muted(` · ${keys.toggle} on`)];
+    case "armed":
+      return [label, on, muted(manual ? ` · ${keys.mark} sets the baseline` : " · baseline at the next agent turn")];
+    case "on":
+      if (view.kind === "since-checkpoint") {
+        return [
+          label,
+          { text: `since ${short(view.base.sha)}`, tone: "accent", attributes: ["bold"] },
+          muted(` ${formatAge(view.base.createdAt, nowMs)} · ${keys.toggle} off · r refresh`),
+        ];
+      }
+      return [label, on, muted(` · base ${short(mode.baseline.sha)} ${formatAge(mode.baseline.createdAt, nowMs)} · full diff`)];
   }
-  if (!mode) {
-    return [
-      label,
-      muted("off"),
-      muted(checkpoint ? ` · base ${short(checkpoint.sha)} · ${keys.toggle} on` : ` · ${keys.toggle} on`),
-    ];
-  }
-  if (!checkpoint) {
-    return [
-      label,
-      { text: "on", tone: "accent" },
-      muted(manual ? ` · ${keys.mark} sets the baseline` : " · baseline at the next agent turn"),
-    ];
-  }
-  const age = formatAge(checkpoint.createdAt, nowMs);
-  if (view.kind === "since-checkpoint") {
-    return [
-      label,
-      { text: `since ${short(view.base)}`, tone: "accent", attributes: ["bold"] },
-      muted(` ${age} · ${keys.toggle} off · r refresh`),
-    ];
-  }
-  return [
-    label,
-    { text: "on", tone: "accent" },
-    muted(` · base ${short(checkpoint.sha)} ${age} · full diff`),
-  ];
 }

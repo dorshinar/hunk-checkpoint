@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { deriveMode, formatAge, parseRangeTitle, statusSpans } from "../src/mode.ts";
+import { deriveView, formatAge, parseRangeTitle, statusSpans } from "../src/mode.ts";
 import { parseArgs } from "../src/cli.ts";
 import { reviewArgs, selectSession } from "../src/session.ts";
 
 const CKPT = "8b10a5db32bc696c306d84b84810c3442f2de99c";
+const ROUND = { sha: CKPT, createdAt: 0, subject: "hunk-checkpoint: review round 1 on main" };
 
 describe("view mode detection", () => {
   it("reads base..head out of a Git comparison title", () => {
@@ -13,16 +14,16 @@ describe("view mode detection", () => {
     assert.equal(parseRangeTitle("repo main..feature"), null);
   });
 
-  it("recognises the since-checkpoint view by its base", () => {
-    assert.deepEqual(deriveMode({ title: "repo 8b10a5d..f821d00" }, [CKPT]), {
+  it("recognises the since-checkpoint view by its base and resolves it to the round", () => {
+    assert.deepEqual(deriveView({ title: "repo 8b10a5d..f821d00" }, [ROUND]), {
       kind: "since-checkpoint",
-      base: "8b10a5d",
+      base: ROUND,
       head: "f821d00",
     });
-    assert.deepEqual(deriveMode({ title: "repo 1111111..f821d00" }, [CKPT]), { kind: "other" });
-    assert.deepEqual(deriveMode({ title: "repo working tree" }, [CKPT]), { kind: "working-tree" });
-    assert.deepEqual(deriveMode({ title: "repo staged changes" }, [CKPT]), { kind: "other" });
-    assert.deepEqual(deriveMode({ title: "repo show HEAD" }, []), { kind: "other" });
+    assert.deepEqual(deriveView({ title: "repo 1111111..f821d00" }, [ROUND]), { kind: "other" });
+    assert.deepEqual(deriveView({ title: "repo working tree" }, [ROUND]), { kind: "working-tree" });
+    assert.deepEqual(deriveView({ title: "repo staged changes" }, [ROUND]), { kind: "other" });
+    assert.deepEqual(deriveView({ title: "repo show HEAD" }, []), { kind: "other" });
   });
 
   it("formats ages", () => {
@@ -36,16 +37,17 @@ describe("view mode detection", () => {
   it("describes the status row", () => {
     const keys = { mark: "C", toggle: "x" };
     const text = (spans: { text: string }[]) => spans.map((span) => span.text).join("");
-    const checkpoint = { sha: CKPT, createdAt: 0, subject: "" };
+    const off = { kind: "off" } as const;
+    const armed = { kind: "armed" } as const;
+    const on = { kind: "on", baseline: ROUND } as const;
     const full = { kind: "working-tree" } as const;
-    const since = { kind: "since-checkpoint", base: CKPT, head: "f" } as const;
-    assert.match(text(statusSpans({ checkpoint: null, view: full, mode: false, manual: false, busy: false, keys })), /off · x on/);
-    assert.match(text(statusSpans({ checkpoint, view: full, mode: false, manual: false, busy: false, keys })), /off · base 8b10a5d · x on/);
-    assert.match(text(statusSpans({ checkpoint: null, view: full, mode: true, manual: false, busy: false, keys })), /on · baseline at the next agent turn/);
-    assert.match(text(statusSpans({ checkpoint: null, view: full, mode: true, manual: true, busy: false, keys })), /on · C sets the baseline/);
-    assert.match(text(statusSpans({ checkpoint, view: full, mode: true, manual: false, busy: false, keys })), /base 8b10a5d .* full diff/);
-    assert.match(text(statusSpans({ checkpoint, view: since, mode: true, manual: false, busy: false, keys })), /since 8b10a5d .* x off · r refresh/);
-    assert.match(text(statusSpans({ checkpoint, view: since, mode: true, manual: false, busy: true, keys })), /snapshotting/);
+    const since = { kind: "since-checkpoint", base: ROUND, head: "f" } as const;
+    assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: false, keys })), /off · x on/);
+    assert.match(text(statusSpans({ mode: armed, view: full, manual: false, busy: false, keys })), /on · baseline at the next agent turn/);
+    assert.match(text(statusSpans({ mode: armed, view: full, manual: true, busy: false, keys })), /on · C sets the baseline/);
+    assert.match(text(statusSpans({ mode: on, view: full, manual: false, busy: false, keys })), /base 8b10a5d .* full diff/);
+    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: false, keys })), /since 8b10a5d .* x off · r refresh/);
+    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: true, keys })), /snapshotting/);
   });
 });
 

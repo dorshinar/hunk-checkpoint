@@ -2,6 +2,9 @@
 
 Incremental review rounds for [Hunk](https://hunk.dev).
 
+Inspired by **herdr-reviewr**, which first turned an agent's turn edges into
+review rounds; its turn tracking is the model this extension follows.
+
 An agent dumps a pile of changes into your working tree. You review them in
 Hunk and leave notes. You hand the notes to the agent. It fixes things. Now you
 want to see **only what it changed in response** — not the whole diff against
@@ -31,9 +34,9 @@ Requires Hunk ≥ 0.23 (extension API 28) and Git ≥ 2.23 (per-worktree refs).
 
 | Key | Command                   | Does                                                                 |
 | --- | ------------------------- | -------------------------------------------------------------------- |
-| `x` | `hunk-checkpoint.toggle`  | Checkpoint mode on/off; starts off, keeps a baseline set with `C`     |
-| `C` | `hunk-checkpoint.mark`    | Set the baseline now (the manual way; automatic inside herdr)        |
-| `X` | `hunk-checkpoint.pick`    | Compare against a stored round, including ones from earlier windows  |
+| `x` | `hunk-checkpoint.toggle`  | Checkpoint mode on/off; starts off                                   |
+| `C` | `hunk-checkpoint.mark`    | Set the baseline now and turn the mode on (automatic inside herdr)   |
+| `X` | `hunk-checkpoint.pick`    | Make a stored round the baseline, including ones from earlier windows |
 | `r` | (Hunk's own refresh)      | In checkpoint mode: close the round and show it against the previous |
 |     | `hunk-checkpoint.refresh` | Same as `r`, unbound, in the Extensions menu                         |
 |     | `hunk-checkpoint.about`   | Version, source path and mtime, herdr detection (Extensions menu)    |
@@ -66,10 +69,10 @@ The status row shows the mode, the baseline, and which view you are in.
 
 Rounds are stored per worktree and survive the window, but a new window never
 assumes one: the baseline is a snapshot taken in this window (`C`, a turn
-start, or `r` by hand). Turn ends and `r` compare against the since view on
-screen when one is mounted, and against that baseline otherwise. Earlier
-rounds are one `X` away when you want them, and `hunk checkpoint clear`
-forgets them.
+start, `r` by hand, or a round picked with `X`), or the base of a since view
+an agent mounted here with `hunk checkpoint sync`. Turn ends and `r` always
+compare against that baseline. Earlier rounds are one `X` away when you want
+them, and `hunk checkpoint clear` forgets them.
 
 The reload is driven through Hunk's session daemon, so it works with or
 without `--watch`. With `--watch` the full-diff view stays live as usual; the
@@ -145,7 +148,7 @@ live window to any `hunk diff …` command. So:
   every `changeset_loaded` / `session_reload`, so an agent reloading the
   session with `-- diff` simply puts you back in the full view. Checkpoint
   mode is per window and starts off; stored rounds are only used when picked
-  explicitly with `X`.
+  with `X` or mounted by `hunk checkpoint sync`.
 - **Agent turns** come from herdr's socket: the roster (`agent.list`) filtered
   to agents whose cwd is inside the worktree, plus a live `events.subscribe`
   on their `pane.agent_status_changed`. Any working member means the worktree
