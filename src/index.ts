@@ -130,12 +130,10 @@ export default function (hunk: HunkExtensionAPI) {
     return next;
   }
 
-  function publishStatus(fallback?: ExtensionStatusLineControls) {
-    if (!showStatus) return;
-    // A command's controls expire when its own reload replaces the review, so
-    // prefer the handle the latest lifecycle event delivered.
-    const statusLine = state.host?.statusLine ?? fallback;
-    if (!statusLine) return;
+  /** Always through the handle the latest lifecycle event delivered: a command's own controls expire when its reload replaces the review. */
+  function publishStatus() {
+    if (!showStatus || !state.host) return;
+    const { statusLine } = state.host;
     if (state.mode.kind === "off" && !state.busy) {
       statusLine.clear(STATUS_ITEM);
       return;
@@ -149,20 +147,19 @@ export default function (hunk: HunkExtensionAPI) {
   }
 
   /** Run `work` as the one snapshot in flight; resolves undefined (after a toast) when another is. */
-  async function withBusy<T>(ctx: ReviewHost, work: () => Promise<T>) {
+  async function withBusy<T>(host: Pick<ReviewHost, "notify">, work: () => Promise<T>) {
     if (state.busy) {
-      debug(`withBusy refused: ${new Error().stack?.split("\n")[2]?.trim()}`);
-      ctx.notify("hunk-checkpoint is still snapshotting; try again in a moment", "warning");
+      debug("snapshot refused: another is in flight");
+      host.notify("hunk-checkpoint is still snapshotting; try again in a moment", "warning");
       return undefined;
     }
-    debug(`withBusy start: ${new Error().stack?.split("\n")[2]?.trim()}`);
     state.busy = true;
-    publishStatus(ctx.statusLine);
+    publishStatus();
     try {
       return await work();
     } finally {
       state.busy = false;
-      publishStatus(ctx.statusLine);
+      publishStatus();
     }
   }
 
@@ -202,25 +199,37 @@ export default function (hunk: HunkExtensionAPI) {
     }
   }
 
-  /**
-   * Snapshot the working tree and point the session at `base..snapshot`. With
-   * `close`, the snapshot is recorded as the next round and becomes the
-   * baseline (the manual turn boundary).
-   *
-   * A round is never recorded twice, and the full diff never gives way to an
-   * empty round; only a mounted since view is refreshed when nothing changed.
-   */
-  async function showRound(host: ReviewHost, repo: GitRepo, base: string, { close = false } = {}): Promise<RoundOutcome> {
-    const refreshEmpty = state.view.kind === "since-checkpoint" && !close;
+  /** Point the session at `base..<snapshot>` as the one snapshot in flight; `snapshot` resolves nothing when there is nothing to show. */
+  async function mountRound(
+    host: ReviewHost,
+    repo: GitRepo,
+    base: string,
+    snapshot: () => Promise<string | null | undefined>,
+  ): Promise<RoundOutcome> {
     const outcome = await withBusy(host, async (): Promise<RoundOutcome> => {
-      const to = close
-        ? (await markBaseline(repo, base))?.sha
-        : await snapshotLive(repo, base, { skipIfSameAs: refreshEmpty ? undefined : base });
+      const to = await snapshot();
       if (!to) return { kind: "empty" };
       await reload(repo, { kind: "range", from: base, to });
       return { kind: "shown", to };
     });
     return outcome ?? { kind: "busy" };
+  }
+
+  /**
+   * Show the working tree against `base`. The full diff never gives way to an
+   * empty round; only a mounted since view is refreshed when nothing changed.
+   */
+  function showRound(host: ReviewHost, repo: GitRepo, base: string) {
+    const refreshEmpty = state.view.kind === "since-checkpoint";
+    return mountRound(host, repo, base, () => snapshotLive(repo, base, { skipIfSameAs: refreshEmpty ? undefined : base }));
+  }
+
+  /**
+   * The manual turn boundary: the working tree becomes the next round and the
+   * baseline, shown against `base`. A round is never recorded twice.
+   */
+  function closeRound(host: ReviewHost, repo: GitRepo, base: string) {
+    return mountRound(host, repo, base, async () => (await markBaseline(repo, base))?.sha);
   }
 
   /** Opt-in: keep a mounted since-view current while the tree moves (for setups without herdr). */
@@ -249,7 +258,7 @@ export default function (hunk: HunkExtensionAPI) {
         // Off: this window's baseline is forgotten; the stored rounds stay
         // in the worktree for `X`.
         state.mode = { kind: "off" };
-        publishStatus(ctx.statusLine);
+        publishStatus();
         if (state.view.kind === "since-checkpoint") {
           await withBusy(ctx, () => reload(repo, { kind: "working-tree" }));
         }
@@ -260,7 +269,7 @@ export default function (hunk: HunkExtensionAPI) {
       // herdr, `r` by hand). Rounds from earlier windows are never assumed;
       // `X` offers them.
       state.mode = { kind: "armed" };
-      publishStatus(ctx.statusLine);
+      publishStatus();
       const earlier = state.rounds.length > 0 ? ` · ${KEYS.pick} compares with ${state.rounds.length} stored round(s)` : "";
       ctx.notify(
         manual
@@ -304,7 +313,7 @@ export default function (hunk: HunkExtensionAPI) {
       ctx.notify(manual ? `No baseline yet — press ${KEYS.mark} first` : "No baseline yet — it is set when the agent starts a turn", "warning");
       return;
     }
-    const outcome = await showRound(ctx, repo, base.sha, { close: manual });
+    const outcome = await (manual ? closeRound(ctx, repo, base.sha) : showRound(ctx, repo, base.sha));
     if (outcome.kind === "empty") {
       ctx.notify(`Nothing changed since ${manual ? "round" : "baseline"} ${short(base.sha)} yet`);
     } else if (outcome.kind === "shown" && manual) {
@@ -342,7 +351,7 @@ export default function (hunk: HunkExtensionAPI) {
       // The picked round is the window's baseline from here on, so `r` and
       // turn ends refresh against it (until the next turn start replaces it).
       state.mode = { kind: "on", baseline: target };
-      publishStatus(ctx.statusLine);
+      publishStatus();
       if ((await showRound(ctx, repo, target.sha)).kind === "empty") {
         ctx.notify(`Nothing changed since round ${short(target.sha)}`);
       }

@@ -13,7 +13,7 @@ import {
   type GitRepo,
 } from "./git.ts";
 import { formatAge } from "./mode.ts";
-import { AmbiguousSessionError, findRepoSession, reloadSession } from "./session.ts";
+import { AmbiguousSessionError, listSessions, reloadSession, selectSession } from "./session.ts";
 
 /**
  * `hunk checkpoint …` — the same operations as the in-window commands, for
@@ -120,9 +120,11 @@ async function requireCheckpoint(repo: GitRepo, since: string | undefined, signa
 async function requireSession(repo: GitRepo, explicitId: string | undefined, signal: AbortSignal) {
   let session;
   try {
-    session = await findRepoSession(repo.root, explicitId, signal);
+    session = selectSession(await listSessions(signal), { explicitId, repoRoot: repo.root });
   } catch (error) {
-    if (error instanceof AmbiguousSessionError) throw new HunkExtensionUserError(error.message);
+    if (error instanceof AmbiguousSessionError) {
+      throw new HunkExtensionUserError(error.message, { suggestions: ["Pass --session <id> to pick one."] });
+    }
     throw error;
   }
   if (!session) {

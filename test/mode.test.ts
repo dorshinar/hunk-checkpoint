@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { deriveView, formatAge, parseRangeTitle, statusSpans } from "../src/mode.ts";
 import { parseArgs } from "../src/cli.ts";
-import { reviewArgs, selectSession } from "../src/session.ts";
+import { AmbiguousSessionError, reviewArgs, selectSession } from "../src/session.ts";
 
 const CKPT = "8b10a5db32bc696c306d84b84810c3442f2de99c";
 const ROUND = { sha: CKPT, createdAt: 0, subject: "hunk-checkpoint: review round 1 on main" };
@@ -15,11 +15,7 @@ describe("view mode detection", () => {
   });
 
   it("recognises the since-checkpoint view by its base and resolves it to the round", () => {
-    assert.deepEqual(deriveView({ title: "repo 8b10a5d..f821d00" }, [ROUND]), {
-      kind: "since-checkpoint",
-      base: ROUND,
-      head: "f821d00",
-    });
+    assert.deepEqual(deriveView({ title: "repo 8b10a5d..f821d00" }, [ROUND]), { kind: "since-checkpoint", base: ROUND });
     assert.deepEqual(deriveView({ title: "repo 1111111..f821d00" }, [ROUND]), { kind: "other" });
     assert.deepEqual(deriveView({ title: "repo working tree" }, [ROUND]), { kind: "working-tree" });
     assert.deepEqual(deriveView({ title: "repo staged changes" }, [ROUND]), { kind: "other" });
@@ -41,7 +37,7 @@ describe("view mode detection", () => {
     const armed = { kind: "armed" } as const;
     const on = { kind: "on", baseline: ROUND } as const;
     const full = { kind: "working-tree" } as const;
-    const since = { kind: "since-checkpoint", base: ROUND, head: "f" } as const;
+    const since = { kind: "since-checkpoint", base: ROUND } as const;
     assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: false, keys })), /off · x on/);
     assert.match(text(statusSpans({ mode: armed, view: full, manual: false, busy: false, keys })), /on · baseline at the next agent turn/);
     assert.match(text(statusSpans({ mode: armed, view: full, manual: true, busy: false, keys })), /on · C sets the baseline/);
@@ -75,7 +71,13 @@ describe("session selection", () => {
 
   it("falls back to the single session on the repo, refusing ambiguity", () => {
     assert.equal(selectSession(sessions, { pid: 99, repoRoot: "/r2" })?.sessionId, "c");
-    assert.equal(selectSession(sessions, { pid: 99, repoRoot: "/r1" }), null);
+    assert.equal(selectSession(sessions, { pid: 99, repoRoot: "/r3" }), null);
+    assert.throws(() => selectSession(sessions, { pid: 99, repoRoot: "/r1" }), AmbiguousSessionError);
+  });
+
+  it("takes an explicit id or prefix over everything else", () => {
+    assert.equal(selectSession(sessions, { explicitId: "c", pid: 10, repoRoot: "/r1" })?.sessionId, "c");
+    assert.throws(() => selectSession(sessions, { explicitId: "zz", repoRoot: "/r1" }), /No live Hunk session matches zz/);
   });
 
   it("spells reload targets as Hunk commands", () => {

@@ -48,19 +48,6 @@ export async function listSessions(signal?: AbortSignal): Promise<LiveSession[]>
   );
 }
 
-/** Pick this process's own session, falling back to the single session on `repoRoot`. */
-export function selectSession(
-  sessions: readonly LiveSession[],
-  { pid, repoRoot }: { pid?: number; repoRoot: string },
-): LiveSession | null {
-  if (pid !== undefined) {
-    const own = sessions.find((session) => session.pid === pid);
-    if (own) return own;
-  }
-  const byRepo = sessions.filter((session) => session.repoRoot === repoRoot);
-  return byRepo.length === 1 ? (byRepo[0] ?? null) : null;
-}
-
 export class AmbiguousSessionError extends Error {
   readonly candidates: readonly LiveSession[];
 
@@ -68,25 +55,37 @@ export class AmbiguousSessionError extends Error {
     super(
       `Several Hunk sessions show this repository: ${candidates
         .map((session) => `${session.sessionId} (${session.title})`)
-        .join(", ")}. Pass --session <id>.`,
+        .join(", ")}.`,
     );
     this.name = "AmbiguousSessionError";
     this.candidates = candidates;
   }
 }
 
-/** Resolve the session a CLI invocation should address. */
-export async function findRepoSession(repoRoot: string, explicitId?: string, signal?: AbortSignal) {
-  const sessions = await listSessions(signal);
+export interface SessionSelector {
+  /** A session id, or a prefix of one, named outright (`--session`). */
+  explicitId?: string | undefined;
+  /** The Hunk process asking, so that its own window wins. */
+  pid?: number | undefined;
+  repoRoot: string;
+}
+
+/**
+ * The one live session a caller means: the one named outright, else this
+ * process's own window, else the single session on `repoRoot`. Null when the
+ * repository has no session; `AmbiguousSessionError` when it has several.
+ */
+export function selectSession(sessions: readonly LiveSession[], { explicitId, pid, repoRoot }: SessionSelector): LiveSession | null {
   if (explicitId) {
-    const match = sessions.find((session) => session.sessionId === explicitId || session.sessionId.startsWith(explicitId));
+    const match = sessions.find((session) => session.sessionId.startsWith(explicitId));
     if (!match) throw new Error(`No live Hunk session matches ${explicitId}.`);
     return match;
   }
+  const own = pid === undefined ? undefined : sessions.find((session) => session.pid === pid);
+  if (own) return own;
   const byRepo = sessions.filter((session) => session.repoRoot === repoRoot);
-  if (byRepo.length === 1) return byRepo[0] ?? null;
   if (byRepo.length > 1) throw new AmbiguousSessionError(byRepo);
-  return null;
+  return byRepo[0] ?? null;
 }
 
 /** Working-tree review (`hunk diff`) or a pinned comparison (`hunk diff a..b`). */

@@ -172,13 +172,34 @@ export function parseEventLine(line: string): HerdrLine {
   return { kind: "ignore" };
 }
 
+/**
+ * Connect to herdr, send one request line, and hand every reply line to
+ * `onLine` until the connection is destroyed. Both the one-shot requests and
+ * the long-lived subscription are this plus what they do with the lines.
+ */
+function openRequest(socket: string, method: string, params: unknown, onLine: (line: string) => void): net.Socket {
+  const connection = net.createConnection({ path: socket });
+  let buffer = "";
+  connection.on("connect", () => {
+    connection.write(`${JSON.stringify({ id: `hunk-checkpoint:${method}`, method, params })}\n`);
+  });
+  connection.on("data", (chunk) => {
+    buffer += chunk.toString("utf8");
+    let newline = buffer.indexOf("\n");
+    while (newline !== -1 && !connection.destroyed) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      onLine(line);
+      newline = buffer.indexOf("\n");
+    }
+  });
+  return connection;
+}
+
 /** One request, one connection, one line back; resolves the `result` payload. */
 export function request(socket: string, method: string, params: unknown = {}, timeoutMs = 7000): Promise<unknown> {
   return new Promise((resolvePromise, reject) => {
-    const connection = net.createConnection({ path: socket });
-    let buffer = "";
     let settled = false;
-    const timer = setTimeout(() => finish(new Error(`herdr did not answer ${method} within ${timeoutMs}ms`)), timeoutMs);
     const finish = (error: Error | null, value?: unknown) => {
       if (settled) return;
       settled = true;
@@ -187,15 +208,10 @@ export function request(socket: string, method: string, params: unknown = {}, ti
       if (error) reject(error);
       else resolvePromise(value);
     };
-    connection.on("connect", () => {
-      connection.write(`${JSON.stringify({ id: `hunk-checkpoint:${method}`, method, params })}\n`);
-    });
-    connection.on("data", (chunk) => {
-      buffer += chunk.toString("utf8");
-      const newline = buffer.indexOf("\n");
-      if (newline === -1) return;
+    const timer = setTimeout(() => finish(new Error(`herdr did not answer ${method} within ${timeoutMs}ms`)), timeoutMs);
+    const connection = openRequest(socket, method, params, (line) => {
       try {
-        const reply = JSON.parse(buffer.slice(0, newline)) as { result?: unknown; error?: { code?: string } };
+        const reply = JSON.parse(line) as { result?: unknown; error?: { code?: string } };
         if (reply.error) finish(new Error(`herdr refused ${method}: ${reply.error.code ?? "unknown"}`));
         else finish(null, reply.result);
       } catch (error) {
@@ -304,38 +320,22 @@ export class HerdrTurnWatcher {
 
   private subscribe(subscriptions: unknown[], generation: number) {
     return new Promise<void>((resolveAck, reject) => {
-      const connection = net.createConnection({ path: this.options.socket });
-      this.connection?.destroy();
-      this.connection = connection;
-      let buffer = "";
       let acked = false;
-      connection.on("connect", () => {
-        connection.write(
-          `${JSON.stringify({ id: "hunk-checkpoint:events", method: "events.subscribe", params: { subscriptions } })}\n`,
-        );
-      });
-      connection.on("data", (chunk) => {
-        buffer += chunk.toString("utf8");
-        let newline = buffer.indexOf("\n");
-        while (newline !== -1) {
-          const line = buffer.slice(0, newline);
-          buffer = buffer.slice(newline + 1);
-          newline = buffer.indexOf("\n");
-          if (generation !== this.generation) return;
-          const parsed = parseEventLine(line);
-          if (!acked) {
-            if (parsed.kind === "ack") {
-              acked = true;
-              resolveAck();
-            } else if (parsed.kind === "error") {
-              reject(new Error(`subscribe refused: ${parsed.code}`));
-              connection.destroy();
-            }
-            continue;
-          }
+      const connection = openRequest(this.options.socket, "events.subscribe", { subscriptions }, (line) => {
+        if (generation !== this.generation) return;
+        const parsed = parseEventLine(line);
+        if (acked) {
           this.handle(parsed);
+        } else if (parsed.kind === "ack") {
+          acked = true;
+          resolveAck();
+        } else if (parsed.kind === "error") {
+          reject(new Error(`subscribe refused: ${parsed.code}`));
+          connection.destroy();
         }
       });
+      this.connection?.destroy();
+      this.connection = connection;
       connection.on("error", (error) => {
         if (!acked) reject(error);
         else this.onConnectionEnded(generation, error.message);

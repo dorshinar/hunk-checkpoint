@@ -4,7 +4,7 @@ import { short, type Checkpoint } from "./git.ts";
 /** What the mounted review is comparing, as far as this extension can tell. */
 export type ViewMode =
   | { kind: "working-tree" }
-  | { kind: "since-checkpoint"; base: Checkpoint; head: string }
+  | { kind: "since-checkpoint"; base: Checkpoint }
   | { kind: "other" };
 
 /**
@@ -26,7 +26,7 @@ export function deriveView(changeset: { title: string }, rounds: readonly Checkp
   const range = parseRangeTitle(changeset.title);
   if (range) {
     const base = rounds.find((round) => round.sha.startsWith(range.base) || range.base.startsWith(round.sha));
-    return base ? { kind: "since-checkpoint", base, head: range.head } : { kind: "other" };
+    return base ? { kind: "since-checkpoint", base } : { kind: "other" };
   }
   if (/\sworking tree$/.test(changeset.title)) return { kind: "working-tree" };
   return { kind: "other" };
