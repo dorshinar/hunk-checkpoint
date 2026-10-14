@@ -11,7 +11,24 @@ export type ViewMode =
  * Checkpoint mode for one window. `armed` is on without a baseline yet (the
  * next `C` or agent turn sets one); `on` carries the window's baseline.
  */
-export type CheckpointMode = { kind: "off" } | { kind: "armed" } | { kind: "on"; baseline: Checkpoint };
+export type CheckpointMode =
+  | { kind: "off" }
+  | { kind: "armed" }
+  | {
+      kind: "on";
+      baseline: Checkpoint;
+      /**
+       * The next turn boundary (an agent's turn start, `r` by hand) leaves the
+       * baseline where it is instead of marking a new round, so that turn's
+       * changes join the round on screen. One-shot; a new baseline clears it.
+       */
+      skipNext: boolean;
+    };
+
+/** Checkpoint mode on with `baseline`, nothing skipped. */
+export function onBaseline(baseline: Checkpoint): CheckpointMode {
+  return { kind: "on", baseline, skipNext: false };
+}
 
 const RANGE_TITLE = /\s([0-9a-f]{7,64})\.\.([0-9a-f]{7,64})$/i;
 
@@ -50,7 +67,7 @@ export interface StatusInput {
   /** Checkpoints are marked by hand (`C`) rather than at each agent turn. */
   manual: boolean;
   busy: boolean;
-  keys: { mark: string; toggle: string };
+  keys: { mark: string; toggle: string; skip: string };
   nowMs?: number;
 }
 
@@ -65,14 +82,16 @@ export function statusSpans({ mode, view, manual, busy, keys, nowMs }: StatusInp
       return [label, muted("off"), muted(` · ${keys.toggle} on`)];
     case "armed":
       return [label, on, muted(manual ? ` · ${keys.mark} sets the baseline` : " · baseline at the next agent turn")];
-    case "on":
+    case "on": {
+      const skip = mode.skipNext ? ` · ${manual ? "r" : "next turn"} keeps it` : "";
       if (view.kind === "since-checkpoint") {
         return [
           label,
           { text: `since ${short(view.base.sha)}`, tone: "accent", attributes: ["bold"] },
-          muted(` ${formatAge(view.base.createdAt, nowMs)} · ${keys.toggle} off · r refresh`),
+          muted(` ${formatAge(view.base.createdAt, nowMs)}${skip} · ${keys.toggle} off · r refresh`),
         ];
       }
-      return [label, on, muted(` · base ${short(mode.baseline.sha)} ${formatAge(mode.baseline.createdAt, nowMs)} · full diff`)];
+      return [label, on, muted(` · base ${short(mode.baseline.sha)} ${formatAge(mode.baseline.createdAt, nowMs)}${skip} · full diff`)];
+    }
   }
 }

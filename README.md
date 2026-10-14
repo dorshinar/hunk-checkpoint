@@ -37,6 +37,7 @@ Requires Hunk ≥ 0.23 (extension API 28) and Git ≥ 2.23 (per-worktree refs).
 | `x` | `hunk-checkpoint.toggle`  | Checkpoint mode on/off; starts off                                   |
 | `C` | `hunk-checkpoint.mark`    | Set the baseline now and turn the mode on (automatic inside herdr)   |
 | `X` | `hunk-checkpoint.pick`    | Make a stored round the baseline, including ones from earlier windows |
+| `S` | `hunk-checkpoint.skip`    | Skip the next baseline: the next turn joins the round on screen      |
 | `r` | (Hunk's own refresh)      | In checkpoint mode: close the round and show it against the previous |
 |     | `hunk-checkpoint.refresh` | Same as `r`, unbound, in the Extensions menu                         |
 |     | `hunk-checkpoint.about`   | Version, source path and mtime, herdr detection (Extensions menu)    |
@@ -66,6 +67,12 @@ The status row shows the mode, the baseline, and which view you are in.
 7. Review that, leave notes, prompt again. Each turn sets a new baseline and
    each turn end reloads the delta. `x` turns the mode off and returns to the
    full diff.
+8. If the agent got it wrong and you are prompting again about the same
+   notes, press `S` first. The next turn starts without a new baseline, so
+   when it ends you see both attempts together against what you reviewed.
+   `S` again cancels; one skip covers one turn, and `C` or `X` clear it.
+   Noticed too late? `X` picks the earlier round as the baseline after the
+   fact.
 
 Rounds are stored per worktree and survive the window, but a new window never
 assumes one: the baseline is a snapshot taken in this window (`C`, a turn
@@ -90,8 +97,9 @@ since view is a pinned snapshot that moves on at turn end (herdr) or on `r`
 - **Manual**: press `C` once to set the first baseline. From then on `r` is
   the turn boundary: it snapshots the working tree as the next round and shows
   it against the previous one. Edit, `C`, edit, `r`, edit, `r`: the last
-  reload compares the third set of changes with the second. Turn ends still
-  reload the since view if herdr is around.
+  reload compares the third set of changes with the second. `S` makes the
+  next `r` show the working tree against the baseline without closing a
+  round. Turn ends still reload the since view if herdr is around.
 - If you force `manual_checkpoints = false` without herdr, Hunk toasts a
   warning once and `C` keeps working.
 
@@ -119,6 +127,10 @@ the automation back:
 > Before touching files in response to the user's Hunk notes, run
 > `hunk checkpoint mark --if-changed`; after addressing them, run
 > `hunk checkpoint sync` so their Hunk window shows only what you changed.
+
+`S` only governs the baselines the window marks itself; an agent running
+`hunk checkpoint mark` still marks one, so tell it not to when you want the
+next attempt folded into the round.
 
 ## How it works
 

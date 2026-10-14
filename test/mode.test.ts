@@ -31,11 +31,12 @@ describe("view mode detection", () => {
   });
 
   it("describes the status row", () => {
-    const keys = { mark: "C", toggle: "x" };
+    const keys = { mark: "C", toggle: "x", skip: "S" };
     const text = (spans: { text: string }[]) => spans.map((span) => span.text).join("");
     const off = { kind: "off" } as const;
     const armed = { kind: "armed" } as const;
-    const on = { kind: "on", baseline: ROUND } as const;
+    const on = { kind: "on", baseline: ROUND, skipNext: false } as const;
+    const skipping = { kind: "on", baseline: ROUND, skipNext: true } as const;
     const full = { kind: "working-tree" } as const;
     const since = { kind: "since-checkpoint", base: ROUND } as const;
     assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: false, keys })), /off · x on/);
@@ -44,6 +45,8 @@ describe("view mode detection", () => {
     assert.match(text(statusSpans({ mode: on, view: full, manual: false, busy: false, keys })), /base 8b10a5d .* full diff/);
     assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: false, keys })), /since 8b10a5d .* x off · r refresh/);
     assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: true, keys })), /snapshotting/);
+    assert.match(text(statusSpans({ mode: skipping, view: since, manual: false, busy: false, keys })), /since 8b10a5d .* next turn keeps it · x off/);
+    assert.match(text(statusSpans({ mode: skipping, view: full, manual: true, busy: false, keys })), /base 8b10a5d .* r keeps it · full diff/);
   });
 });
 

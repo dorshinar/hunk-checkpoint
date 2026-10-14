@@ -9,7 +9,7 @@ import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
 import { listCheckpoints, markCheckpoint, resolveRepo, short, snapshotLive, type Checkpoint, type GitRepo } from "./git.ts";
 import { HerdrTurnWatcher, herdrSocketPath } from "./herdr.ts";
-import { deriveView, formatAge, statusSpans, type CheckpointMode, type ViewMode } from "./mode.ts";
+import { deriveView, formatAge, onBaseline, statusSpans, type CheckpointMode, type ViewMode } from "./mode.ts";
 import { WorkingTreePoller } from "./poll.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
 
@@ -27,13 +27,16 @@ import { listSessions, reloadSession, selectSession, type LiveSession, type Revi
  *    Outside herdr (or with `manual_checkpoints = true`) you press `C`.
  * 5. When the agent's turn ends, the review reloads as "changes since the
  *    baseline": only what the agent did in response.
+ * 6. If the agent got it wrong, press `S` before prompting again: the next
+ *    turn keeps the baseline, so both attempts show together against what
+ *    you reviewed.
  *
  * Snapshots are commit objects on per-worktree refs; the live window is
  * steered through Hunk's session daemon, so it works with or without
  * `--watch`.
  */
 
-const KEYS = { mark: "C", toggle: "x", pick: "X" };
+const KEYS = { mark: "C", toggle: "x", pick: "X", skip: "S" };
 const STATUS_ITEM = "state";
 const BUILD = buildStamp(import.meta.url);
 
@@ -124,7 +127,7 @@ export default function (hunk: HunkExtensionAPI) {
   async function markBaseline(repo: GitRepo, skipIfSameAs?: string) {
     const next = await markCheckpoint(repo, { skipIfSameAs });
     if (next) {
-      state.mode = { kind: "on", baseline: next };
+      state.mode = onBaseline(next);
       state.rounds = [next, ...state.rounds];
     }
     return next;
@@ -308,18 +311,53 @@ export default function (hunk: HunkExtensionAPI) {
       ctx.notify("Rounds refresh the working tree or a since view; this review is neither", "warning");
       return;
     }
-    const base = baseline();
-    if (!base) {
+    const mode = state.mode;
+    if (mode.kind !== "on") {
       ctx.notify(manual ? `No baseline yet — press ${KEYS.mark} first` : "No baseline yet — it is set when the agent starts a turn", "warning");
       return;
     }
-    const outcome = await (manual ? closeRound(ctx, repo, base.sha) : showRound(ctx, repo, base.sha));
+    const base = mode.baseline;
+    // By hand, `S` makes this `r` the one turn boundary that records nothing.
+    const close = manual && !mode.skipNext;
+    const outcome = await (close ? closeRound(ctx, repo, base.sha) : showRound(ctx, repo, base.sha));
+    if (outcome.kind === "busy") return;
+    if (manual && mode.skipNext) consumeSkip();
     if (outcome.kind === "empty") {
       ctx.notify(`Nothing changed since ${manual ? "round" : "baseline"} ${short(base.sha)} yet`);
-    } else if (outcome.kind === "shown" && manual) {
+    } else if (outcome.kind === "shown" && close) {
       ctx.notify(`Round ${short(outcome.to)} closed — showing it against ${short(base.sha)}`);
+    } else if (outcome.kind === "shown" && manual) {
+      ctx.notify(`Showing changes since round ${short(base.sha)} — no round closed`);
     }
   }
+
+  /** The skipped turn boundary has passed; the next one marks again. */
+  function consumeSkip() {
+    if (state.mode.kind === "on") state.mode = { ...state.mode, skipNext: false };
+    publishStatus();
+  }
+
+  hunk.registerCommand(
+    { id: "skip", title: "Checkpoint: skip the next baseline (the next turn joins this round)", key: KEYS.skip },
+    async (ctx) => {
+      const mode = state.mode;
+      if (mode.kind !== "on") {
+        ctx.notify(
+          mode.kind === "off" ? `Checkpoint mode is off — press ${KEYS.toggle} first` : "No baseline to keep yet",
+          "warning",
+        );
+        return;
+      }
+      state.mode = { ...mode, skipNext: !mode.skipNext };
+      publishStatus();
+      const boundary = manual ? "r" : "agent turn";
+      ctx.notify(
+        state.mode.skipNext
+          ? `Next ${boundary} keeps baseline ${short(mode.baseline.sha)} — its changes join this round (${KEYS.skip} again to undo)`
+          : `Next ${boundary} sets a new baseline again`,
+      );
+    },
+  );
 
   hunk.registerCommand(
     { id: "refresh", title: "Checkpoint: close this round and show it against the previous one" },
@@ -350,7 +388,7 @@ export default function (hunk: HunkExtensionAPI) {
       if (!target) return;
       // The picked round is the window's baseline from here on, so `r` and
       // turn ends refresh against it (until the next turn start replaces it).
-      state.mode = { kind: "on", baseline: target };
+      state.mode = onBaseline(target);
       publishStatus();
       if ((await showRound(ctx, repo, target.sha)).kind === "empty") {
         ctx.notify(`Nothing changed since round ${short(target.sha)}`);
@@ -367,7 +405,7 @@ export default function (hunk: HunkExtensionAPI) {
         `source: ${BUILD.source}`,
         `extension API: ${hunk.apiVersion}`,
         `herdr: ${herdrSocket ? `socket ${herdrSocket}` : "off"} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
-        `worktree: ${repo} · checkpoint mode: ${state.mode.kind}${base ? ` (baseline ${short(base.sha)})` : ""} · stored rounds: ${state.rounds.length}`,
+        `worktree: ${repo} · checkpoint mode: ${state.mode.kind}${base ? ` (baseline ${short(base.sha)}${state.mode.kind === "on" && state.mode.skipNext ? ", next skipped" : ""})` : ""} · stored rounds: ${state.rounds.length}`,
       ].join("\n"),
       confirmLabel: "ok",
       cancelLabel: "close",
@@ -415,13 +453,20 @@ export default function (hunk: HunkExtensionAPI) {
     state.host?.notify(`hunk-checkpoint ${what}: ${detail}`, "warning");
   }
 
-  /** The agent started working: what you were looking at becomes the baseline. */
+  /** The agent started working: what you were looking at becomes the baseline, unless `S` asked to keep the current one. */
   async function onTurnStart(repo: GitRepo) {
-    if (manual || state.mode.kind === "off" || !state.host) {
+    const host = state.host;
+    if (manual || state.mode.kind === "off" || !host) {
       debug(`turn start ignored (manual=${manual} mode=${state.mode.kind})`);
       return;
     }
-    await withBusy(state.host, async () => {
+    if (state.mode.kind === "on" && state.mode.skipNext) {
+      const kept = state.mode.baseline;
+      consumeSkip();
+      host.notify(`Agent started — baseline ${short(kept.sha)} kept; this turn joins the round`);
+      return;
+    }
+    await withBusy(host, async () => {
       const checkpoint = await markBaseline(repo, baseline()?.sha);
       if (checkpoint) state.host?.notify(`Agent started — baseline ${short(checkpoint.sha)} is what you just reviewed`);
     });
@@ -466,7 +511,7 @@ export default function (hunk: HunkExtensionAPI) {
       // A since view mounted while this window has no baseline (an agent's
       // `hunk checkpoint sync`) hands it one: its base.
       if (state.view.kind === "since-checkpoint" && state.mode.kind !== "on") {
-        state.mode = { kind: "on", baseline: state.view.base };
+        state.mode = onBaseline(state.view.base);
       }
       publishStatus();
       ensureWatcher();
