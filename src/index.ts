@@ -150,17 +150,28 @@ export default function (hunk: HunkExtensionAPI) {
     });
   }
 
-  /** Run `work` as the one exclusive job in flight, shown as `activity`; resolves undefined (after a toast) when another is. */
-  async function withBusy<T>(host: Pick<ReviewHost, "notify">, activity: Activity, work: () => Promise<T>) {
+  /**
+   * Run `work` as the one exclusive job in flight, shown as `activity` until
+   * `work` moves on to another with `phase`. Resolves undefined (after a
+   * toast) when another job is running.
+   */
+  async function withBusy<T>(
+    host: Pick<ReviewHost, "notify">,
+    activity: Activity,
+    work: (phase: (next: Activity) => void) => Promise<T>,
+  ) {
     if (state.busy) {
       debug(`${activity} refused: still ${state.busy}`);
       host.notify(`hunk-checkpoint is still ${state.busy}; try again in a moment`, "warning");
       return undefined;
     }
-    state.busy = activity;
-    publishStatus();
+    const phase = (next: Activity) => {
+      state.busy = next;
+      publishStatus();
+    };
+    phase(activity);
     try {
-      return await work();
+      return await work(phase);
     } finally {
       state.busy = null;
       publishStatus();
@@ -203,16 +214,17 @@ export default function (hunk: HunkExtensionAPI) {
     }
   }
 
-  /** Point the session at `base..<snapshot>` as the one snapshot in flight; `snapshot` resolves nothing when there is nothing to show. */
+  /** Point the session at `base..<snapshot>` as the one job in flight; `snapshot` resolves nothing when there is nothing to show. */
   async function mountRound(
     host: ReviewHost,
     repo: GitRepo,
     base: string,
     snapshot: () => Promise<string | null | undefined>,
   ): Promise<RoundOutcome> {
-    const outcome = await withBusy(host, "snapshotting", async (): Promise<RoundOutcome> => {
+    const outcome = await withBusy(host, "snapshotting", async (phase): Promise<RoundOutcome> => {
       const to = await snapshot();
       if (!to) return { kind: "empty" };
+      phase("reloading");
       await reload(repo, { kind: "range", from: base, to });
       return { kind: "shown", to };
     });
@@ -288,11 +300,12 @@ export default function (hunk: HunkExtensionAPI) {
     async (ctx) => {
       const repo = await ensureRepo(ctx.cwd);
       const wasOff = state.mode.kind === "off";
-      await withBusy(ctx, "snapshotting", async () => {
+      await withBusy(ctx, "snapshotting", async (phase) => {
         const checkpoint = await markBaseline(repo);
         ctx.notify(`Baseline ${short(checkpoint.sha)} saved${wasOff ? " — checkpoint mode on" : ""}`);
         if (state.view.kind === "since-checkpoint") {
           // The since-view would now be empty; fall back to the full diff.
+          phase("reloading");
           await reload(repo, { kind: "working-tree" });
         }
       });
