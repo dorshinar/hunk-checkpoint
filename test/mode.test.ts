@@ -39,14 +39,15 @@ describe("view mode detection", () => {
     const skipping = { kind: "on", baseline: ROUND, skipNext: true } as const;
     const full = { kind: "working-tree" } as const;
     const since = { kind: "since-checkpoint", base: ROUND } as const;
-    assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: false, keys })), /off · x on/);
-    assert.match(text(statusSpans({ mode: armed, view: full, manual: false, busy: false, keys })), /on · baseline at the next agent turn/);
-    assert.match(text(statusSpans({ mode: armed, view: full, manual: true, busy: false, keys })), /on · C sets the baseline/);
-    assert.match(text(statusSpans({ mode: on, view: full, manual: false, busy: false, keys })), /base 8b10a5d .* full diff/);
-    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: false, keys })), /since 8b10a5d .* x off · r refresh/);
-    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: true, keys })), /snapshotting/);
-    assert.match(text(statusSpans({ mode: skipping, view: since, manual: false, busy: false, keys })), /since 8b10a5d .* next turn keeps it · x off/);
-    assert.match(text(statusSpans({ mode: skipping, view: full, manual: true, busy: false, keys })), /base 8b10a5d .* r keeps it · full diff/);
+    assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: null, keys })), /off · x on/);
+    assert.match(text(statusSpans({ mode: armed, view: full, manual: false, busy: null, keys })), /on · baseline at the next agent turn/);
+    assert.match(text(statusSpans({ mode: armed, view: full, manual: true, busy: null, keys })), /on · C sets the baseline/);
+    assert.match(text(statusSpans({ mode: on, view: full, manual: false, busy: null, keys })), /base 8b10a5d .* full diff/);
+    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: null, keys })), /since 8b10a5d .* x off · r refresh/);
+    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: "snapshotting", keys })), /snapshotting…/);
+    assert.match(text(statusSpans({ mode: on, view: since, manual: false, busy: "reloading", keys })), /reloading…/);
+    assert.match(text(statusSpans({ mode: skipping, view: since, manual: false, busy: null, keys })), /since 8b10a5d .* next turn keeps it · x off/);
+    assert.match(text(statusSpans({ mode: skipping, view: full, manual: true, busy: null, keys })), /base 8b10a5d .* r keeps it · full diff/);
   });
 });
 

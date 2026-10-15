@@ -60,13 +60,17 @@ export function formatAge(createdAtSeconds: number, nowMs = Date.now()) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+/** The exclusive jobs the status row can report. */
+export type Activity = "snapshotting" | "reloading";
+
 export interface StatusInput {
   mode: CheckpointMode;
   /** What the mounted review compares. */
   view: ViewMode;
   /** Checkpoints are marked by hand (`C`) rather than at each agent turn. */
   manual: boolean;
-  busy: boolean;
+  /** What the one exclusive job in flight is doing, or null when idle. */
+  busy: Activity | null;
   keys: { mark: string; toggle: string; skip: string };
   nowMs?: number;
 }
@@ -76,7 +80,7 @@ export function statusSpans({ mode, view, manual, busy, keys, nowMs }: StatusInp
   const label: ExtensionStatusSpan = { text: "ckpt ", tone: "muted" };
   const on: ExtensionStatusSpan = { text: "on", tone: "accent" };
   const muted = (text: string): ExtensionStatusSpan => ({ text, tone: "muted" });
-  if (busy) return [label, { text: "snapshotting…", tone: "accent" }];
+  if (busy) return [label, { text: `${busy}…`, tone: "accent" }];
   switch (mode.kind) {
     case "off":
       return [label, muted("off"), muted(` · ${keys.toggle} on`)];

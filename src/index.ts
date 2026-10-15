@@ -9,7 +9,7 @@ import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
 import { listCheckpoints, markCheckpoint, resolveRepo, short, snapshotLive, type Checkpoint, type GitRepo } from "./git.ts";
 import { HerdrTurnWatcher, herdrSocketPath } from "./herdr.ts";
-import { deriveView, formatAge, onBaseline, statusSpans, type CheckpointMode, type ViewMode } from "./mode.ts";
+import { deriveView, formatAge, onBaseline, statusSpans, type Activity, type CheckpointMode, type ViewMode } from "./mode.ts";
 import { WorkingTreePoller } from "./poll.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
 
@@ -68,7 +68,8 @@ interface State {
   rounds: Checkpoint[];
   /** What the mounted review compares, read from its title. */
   view: ViewMode;
-  busy: boolean;
+  /** The exclusive job in flight (a snapshot, or a reload of the window), or null. */
+  busy: Activity | null;
   session: LiveSession | null;
   /** Controls from the newest review generation; older handles go inert on reload. */
   host: ReviewHost | null;
@@ -93,7 +94,7 @@ export default function (hunk: HunkExtensionAPI) {
     mode: { kind: "off" },
     rounds: [],
     view: { kind: "working-tree" },
-    busy: false,
+    busy: null,
     session: null,
     host: null,
     watcher: null,
@@ -149,19 +150,19 @@ export default function (hunk: HunkExtensionAPI) {
     });
   }
 
-  /** Run `work` as the one snapshot in flight; resolves undefined (after a toast) when another is. */
-  async function withBusy<T>(host: Pick<ReviewHost, "notify">, work: () => Promise<T>) {
+  /** Run `work` as the one exclusive job in flight, shown as `activity`; resolves undefined (after a toast) when another is. */
+  async function withBusy<T>(host: Pick<ReviewHost, "notify">, activity: Activity, work: () => Promise<T>) {
     if (state.busy) {
-      debug("snapshot refused: another is in flight");
-      host.notify("hunk-checkpoint is still snapshotting; try again in a moment", "warning");
+      debug(`${activity} refused: still ${state.busy}`);
+      host.notify(`hunk-checkpoint is still ${state.busy}; try again in a moment`, "warning");
       return undefined;
     }
-    state.busy = true;
+    state.busy = activity;
     publishStatus();
     try {
       return await work();
     } finally {
-      state.busy = false;
+      state.busy = null;
       publishStatus();
     }
   }
@@ -209,7 +210,7 @@ export default function (hunk: HunkExtensionAPI) {
     base: string,
     snapshot: () => Promise<string | null | undefined>,
   ): Promise<RoundOutcome> {
-    const outcome = await withBusy(host, async (): Promise<RoundOutcome> => {
+    const outcome = await withBusy(host, "snapshotting", async (): Promise<RoundOutcome> => {
       const to = await snapshot();
       if (!to) return { kind: "empty" };
       await reload(repo, { kind: "range", from: base, to });
@@ -263,7 +264,7 @@ export default function (hunk: HunkExtensionAPI) {
         state.mode = { kind: "off" };
         publishStatus();
         if (state.view.kind === "since-checkpoint") {
-          await withBusy(ctx, () => reload(repo, { kind: "working-tree" }));
+          await withBusy(ctx, "reloading", () => reload(repo, { kind: "working-tree" }));
         }
         ctx.notify("Checkpoint mode off — showing the full diff");
         return;
@@ -287,7 +288,7 @@ export default function (hunk: HunkExtensionAPI) {
     async (ctx) => {
       const repo = await ensureRepo(ctx.cwd);
       const wasOff = state.mode.kind === "off";
-      await withBusy(ctx, async () => {
+      await withBusy(ctx, "snapshotting", async () => {
         const checkpoint = await markBaseline(repo);
         ctx.notify(`Baseline ${short(checkpoint.sha)} saved${wasOff ? " — checkpoint mode on" : ""}`);
         if (state.view.kind === "since-checkpoint") {
@@ -466,7 +467,7 @@ export default function (hunk: HunkExtensionAPI) {
       host.notify(`Agent started — baseline ${short(kept.sha)} kept; this turn joins the round`);
       return;
     }
-    await withBusy(host, async () => {
+    await withBusy(host, "snapshotting", async () => {
       const checkpoint = await markBaseline(repo, baseline()?.sha);
       if (checkpoint) state.host?.notify(`Agent started — baseline ${short(checkpoint.sha)} is what you just reviewed`);
     });
