@@ -4,15 +4,8 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
-import {
-  HerdrTurnWatcher,
-  TurnTracker,
-  foldState,
-  isMember,
-  parseAgents,
-  parseEventLine,
-  request,
-} from "../src/herdr.ts";
+import { HerdrTurnWatcher, parseAgents, parseEventLine, request } from "../src/herdr.ts";
+import { TurnTracker, foldState, isMember } from "../src/turns.ts";
 
 describe("turn model", () => {
   it("folds member statuses", () => {
@@ -61,8 +54,8 @@ describe("turn model", () => {
       ],
     });
     assert.deepEqual(agents, [
-      { paneId: "w1:p1", status: "working", cwd: "/a/web" },
-      { paneId: "w1:p2", status: "unknown", cwd: null },
+      { id: "w1:p1", status: "working", cwd: "/a/web" },
+      { id: "w1:p2", status: "unknown", cwd: null },
     ]);
     assert.deepEqual(parseEventLine('{"id":"x","result":{"type":"subscription_started"}}'), { kind: "ack" });
     assert.deepEqual(parseEventLine('{"event":"pane.agent_status_changed","data":{"pane_id":"w1:p1","agent_status":"idle"}}'), {

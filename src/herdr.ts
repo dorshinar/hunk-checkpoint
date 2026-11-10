@@ -1,29 +1,23 @@
-import { realpathSync } from "node:fs";
-import net from "node:net";
-import { resolve, sep } from "node:path";
+import type net from "node:net";
+import {
+  type AgentStatus,
+  TurnWatcher,
+  type TurnWatcherOptions,
+  type WorktreeAgent,
+  firstReply,
+  openLineConnection,
+  statusFromWire,
+} from "./turns.ts";
 
 /**
- * herdr integration: turn edges for the agents working in this worktree.
+ * herdr TUI integration: turn edges over the terminal UI's socket.
  *
  * herdr (https://herdr.dev) runs each pane with `HERDR_SOCKET_PATH`. Its
  * socket speaks one JSON line per connection — `ping`, `agent.list` — and
  * keeps an `events.subscribe` connection open, streaming one JSON line per
- * event. The agent roster carries `agent_status` (`idle`, `working`,
- * `blocked`, `done`) and `cwd`, so the agents of one worktree can be told
- * apart and their rest→work→rest cycle read as a turn. The model follows
- * herdr-reviewr's turn tracking: any working member means the worktree
- * works; a turn starts on the resting→working edge and ends when every
- * member rests again after work.
+ * event. The agent roster carries `agent_status` and `cwd`. The herdr app
+ * runs on herdr-core instead; see `hc.ts`.
  */
-
-export type AgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
-export type WorktreeState = "resting" | "working" | "neither";
-
-export interface HerdrAgent {
-  paneId: string;
-  status: AgentStatus;
-  cwd: string | null;
-}
 
 /** The herdr socket this process was launched under, or null outside herdr. */
 export function herdrSocketPath(env: NodeJS.ProcessEnv = process.env) {
@@ -31,85 +25,8 @@ export function herdrSocketPath(env: NodeJS.ProcessEnv = process.env) {
   return path && path.trim() !== "" ? path : null;
 }
 
-function statusFromWire(value: unknown): AgentStatus {
-  switch (value) {
-    case "idle":
-    case "working":
-    case "blocked":
-    case "done":
-      return value;
-    default:
-      return "unknown";
-  }
-}
-
-/** A status between turns; `blocked` (permission prompt) and `unknown` are mid-turn. */
-function isResting(status: AgentStatus) {
-  return status === "idle" || status === "done";
-}
-
-/** Fold the members' statuses: any working agent wins, a held one keeps a turn open. */
-export function foldState(statuses: Iterable<AgentStatus>): WorktreeState {
-  let held = false;
-  for (const status of statuses) {
-    if (status === "working") return "working";
-    held ||= !isResting(status);
-  }
-  return held ? "neither" : "resting";
-}
-
-export interface TurnTransition {
-  started: boolean;
-  ended: boolean;
-}
-
-/** The worktree's turn edges, read from successive folded states. */
-export class TurnTracker {
-  /** Whether the previous sample rested; false first, so the first sample starts nothing. */
-  private prevResting = false;
-  /** Whether the worktree worked since its last rest. */
-  private worked = false;
-
-  /** Work was seen since the last rest, so a rest now would end a turn. */
-  get inTurn() {
-    return this.worked;
-  }
-
-  observe(state: WorktreeState): TurnTransition {
-    const transition = {
-      started: state === "working" && this.prevResting,
-      ended: this.worked && state === "resting",
-    };
-    this.prevResting = state === "resting";
-    if (state === "working") this.worked = true;
-    else if (state === "resting") this.worked = false;
-    return transition;
-  }
-
-  /** Nobody watched the agents for a while: the next sample cannot start a turn. */
-  gap() {
-    this.prevResting = false;
-  }
-}
-
-function canonical(path: string) {
-  try {
-    return realpathSync(path);
-  } catch {
-    return resolve(path);
-  }
-}
-
-/** Whether an agent at `cwd` works inside `repoRoot` (a subdirectory counts, a sibling worktree does not). */
-export function isMember(cwd: string | null | undefined, repoRoot: string) {
-  if (!cwd || !resolve(cwd).startsWith("/")) return false;
-  const root = canonical(repoRoot);
-  const where = canonical(cwd);
-  return where === root || where.startsWith(root + sep);
-}
-
 /** Read the documented `agents` array out of an `agent.list` result. */
-export function parseAgents(result: unknown): HerdrAgent[] {
+export function parseAgents(result: unknown): WorktreeAgent[] {
   const agents = (result as { agents?: unknown })?.agents;
   if (!Array.isArray(agents)) return [];
   return agents.flatMap((entry) => {
@@ -118,7 +35,7 @@ export function parseAgents(result: unknown): HerdrAgent[] {
     const cwd = record.foreground_cwd ?? record.cwd;
     return [
       {
-        paneId: record.pane_id,
+        id: record.pane_id,
         status: statusFromWire(record.agent_status),
         cwd: typeof cwd === "string" ? cwd : null,
       },
@@ -172,119 +89,36 @@ export function parseEventLine(line: string): HerdrLine {
   return { kind: "ignore" };
 }
 
-/**
- * Connect to herdr, send one request line, and hand every reply line to
- * `onLine` until the connection is destroyed. Both the one-shot requests and
- * the long-lived subscription are this plus what they do with the lines.
- */
-function openRequest(socket: string, method: string, params: unknown, onLine: (line: string) => void): net.Socket {
-  const connection = net.createConnection({ path: socket });
-  let buffer = "";
-  connection.on("connect", () => {
-    connection.write(`${JSON.stringify({ id: `hunk-checkpoint:${method}`, method, params })}\n`);
-  });
-  connection.on("data", (chunk) => {
-    buffer += chunk.toString("utf8");
-    let newline = buffer.indexOf("\n");
-    while (newline !== -1 && !connection.destroyed) {
-      const line = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
-      onLine(line);
-      newline = buffer.indexOf("\n");
-    }
-  });
-  return connection;
+function openRequest(socket: string, method: string, params: unknown, onLine: (line: string) => void) {
+  return openLineConnection(socket, JSON.stringify({ id: `hunk-checkpoint:${method}`, method, params }), onLine);
 }
 
 /** One request, one connection, one line back; resolves the `result` payload. */
-export function request(socket: string, method: string, params: unknown = {}, timeoutMs = 7000): Promise<unknown> {
-  return new Promise((resolvePromise, reject) => {
-    let settled = false;
-    const finish = (error: Error | null, value?: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      connection.destroy();
-      if (error) reject(error);
-      else resolvePromise(value);
-    };
-    const timer = setTimeout(() => finish(new Error(`herdr did not answer ${method} within ${timeoutMs}ms`)), timeoutMs);
-    const connection = openRequest(socket, method, params, (line) => {
-      try {
-        const reply = JSON.parse(line) as { result?: unknown; error?: { code?: string } };
-        if (reply.error) finish(new Error(`herdr refused ${method}: ${reply.error.code ?? "unknown"}`));
-        else finish(null, reply.result);
-      } catch (error) {
-        finish(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-    connection.on("error", (error) => finish(error));
-    connection.on("close", () => finish(new Error(`herdr closed the ${method} connection without answering`)));
-  });
-}
-
-export interface TurnWatcherOptions {
-  socket: string;
-  repoRoot: string;
-  /** A member went from resting to working. */
-  onTurnStart?: () => void;
-  /** Every member rests again after work, and stayed so for `settleMs`. */
-  onTurnEnd?: () => void;
-  log?: (message: string) => void;
-  /** How long rest must last before a turn counts as ended; absorbs brief idle blips. */
-  settleMs?: number;
-  /** Reconnect backoff bounds. */
-  backoffMs?: { min: number; max: number };
+export async function request(socket: string, method: string, params: unknown = {}, timeoutMs = 7000): Promise<unknown> {
+  const line = JSON.stringify({ id: `hunk-checkpoint:${method}`, method, params });
+  const reply = (await firstReply(socket, line, `herdr ${method}`, timeoutMs)) as { result?: unknown; error?: { code?: string } };
+  if (reply.error) throw new Error(`herdr refused ${method}: ${reply.error.code ?? "unknown"}`);
+  return reply.result;
 }
 
 /**
- * Follow the turns of one worktree over the herdr socket, reconnecting on loss.
- *
  * One live `events.subscribe` connection carries the membership events plus
  * a status subscription per member pane. When membership changes, the roster
  * is read again and the subscription replaced.
- *
- * The tracker only ever sees settled states: a rest that follows work is held
- * back for `settleMs`, and dropped if work resumes meanwhile, so an idle blip
- * neither ends the turn nor starts a new one.
  */
-export class HerdrTurnWatcher {
-  private readonly options: Required<Pick<TurnWatcherOptions, "settleMs" | "backoffMs">> & TurnWatcherOptions;
-  private readonly tracker = new TurnTracker();
-  private members = new Map<string, HerdrAgent>();
+export class HerdrTurnWatcher extends TurnWatcher {
   private connection: net.Socket | null = null;
-  private stopped = false;
-  private generation = 0;
-  private endTimer: ReturnType<typeof setTimeout> | null = null;
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private backoff: number;
 
   constructor(options: TurnWatcherOptions) {
-    this.options = { settleMs: 1500, backoffMs: { min: 1000, max: 30000 }, ...options };
-    this.backoff = this.options.backoffMs.min;
+    super("herdr", options);
   }
 
-  start() {
-    this.stopped = false;
-    void this.cycle();
-  }
-
-  stop() {
-    this.stopped = true;
-    this.generation += 1;
-    this.cancelSettle();
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = null;
+  protected disconnect() {
     this.connection?.destroy();
     this.connection = null;
   }
 
-  private log(message: string) {
-    this.options.log?.(`herdr: ${message}`);
-  }
-
-  /** Connect, read the roster, subscribe, and follow events until the connection ends. */
-  private async cycle(): Promise<void> {
+  protected async cycle(): Promise<void> {
     if (this.stopped) return;
     const generation = ++this.generation;
     try {
@@ -298,7 +132,7 @@ export class HerdrTurnWatcher {
       if (generation !== this.generation) return;
       // Statuses may have moved while subscribing; the fresh roster is authoritative.
       await this.readRoster();
-      this.backoff = this.options.backoffMs.min;
+      this.connected();
       this.log(`following ${this.members.size} agent(s) of ${this.options.repoRoot} (${roster.length} total)`);
     } catch (error) {
       if (generation !== this.generation || this.stopped) return;
@@ -309,12 +143,7 @@ export class HerdrTurnWatcher {
 
   private async readRoster() {
     const roster = parseAgents(await request(this.options.socket, "agent.list"));
-    const members = new Map<string, HerdrAgent>();
-    for (const agent of roster) {
-      if (isMember(agent.cwd, this.options.repoRoot)) members.set(agent.paneId, agent);
-    }
-    this.members = members;
-    this.observe();
+    this.setMembers(roster);
     return roster;
   }
 
@@ -353,17 +182,6 @@ export class HerdrTurnWatcher {
     this.lose();
   }
 
-  /** Back off, then start over; nobody watched meanwhile so the next sample starts nothing. */
-  private lose() {
-    this.tracker.gap();
-    this.connection?.destroy();
-    this.connection = null;
-    const wait = this.backoff;
-    this.backoff = Math.min(this.backoff * 2, this.options.backoffMs.max);
-    this.reconnectTimer = setTimeout(() => void this.cycle(), wait);
-    this.reconnectTimer.unref?.();
-  }
-
   private handle(line: HerdrLine) {
     switch (line.kind) {
       case "status": {
@@ -375,12 +193,12 @@ export class HerdrTurnWatcher {
       }
       case "membership":
         // The roster changed under us: re-read it and replace the subscription.
-        this.backoff = this.options.backoffMs.min;
+        this.connected();
         void this.cycle();
         return;
       case "lost":
         this.log("herdr dropped events; re-reading the roster");
-        this.tracker.gap();
+        this.gap();
         void this.cycle();
         return;
       case "error":
@@ -389,41 +207,6 @@ export class HerdrTurnWatcher {
         return;
       default:
         return;
-    }
-  }
-
-  private observe() {
-    const state = foldState([...this.members.values()].map((agent) => agent.status));
-    if (state === "resting" && this.tracker.inTurn) {
-      // Rest after work must last before it counts; the first resting sample starts the clock.
-      if (!this.endTimer) {
-        this.endTimer = setTimeout(() => {
-          this.endTimer = null;
-          if (!this.stopped) this.settle("resting");
-        }, this.options.settleMs);
-        this.endTimer.unref?.();
-      }
-      return;
-    }
-    this.cancelSettle();
-    this.settle(state);
-  }
-
-  private cancelSettle() {
-    if (this.endTimer) clearTimeout(this.endTimer);
-    this.endTimer = null;
-  }
-
-  /** Feed one settled state to the tracker and report its edges. */
-  private settle(state: WorktreeState) {
-    const { started, ended } = this.tracker.observe(state);
-    if (started) {
-      this.log("turn started");
-      this.options.onTurnStart?.();
-    }
-    if (ended) {
-      this.log("turn ended");
-      this.options.onTurnEnd?.();
     }
   }
 }

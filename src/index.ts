@@ -8,7 +8,8 @@ import type {
 import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
 import { listCheckpoints, markCheckpoint, resolveRepo, short, snapshotLive, type Checkpoint, type GitRepo } from "./git.ts";
-import { HerdrTurnWatcher, herdrSocketPath } from "./herdr.ts";
+import { createTurnWatcher, describeAgentHost, detectAgentHost } from "./agent-host.ts";
+import type { TurnWatcher } from "./turns.ts";
 import { deriveView, formatAge, onBaseline, statusSpans, type Activity, type CheckpointMode, type ViewMode } from "./mode.ts";
 import { WorkingTreePoller } from "./poll.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
@@ -73,7 +74,7 @@ interface State {
   session: LiveSession | null;
   /** Controls from the newest review generation; older handles go inert on reload. */
   host: ReviewHost | null;
-  watcher: HerdrTurnWatcher | null;
+  watcher: TurnWatcher | null;
   warnedAboutAutomatic: boolean;
 }
 
@@ -81,10 +82,10 @@ interface State {
 type RoundOutcome = { kind: "shown"; to: string } | { kind: "empty" } | { kind: "busy" };
 
 export default function (hunk: HunkExtensionAPI) {
-  const herdrSocket = hunk.config.herdr !== false ? herdrSocketPath() : null;
+  const agentHost = hunk.config.herdr !== false ? detectAgentHost() : null;
   /** Checkpoints are marked by hand unless herdr can mark them at each agent turn. */
   const manual =
-    typeof hunk.config.manual_checkpoints === "boolean" ? hunk.config.manual_checkpoints : herdrSocket === null;
+    typeof hunk.config.manual_checkpoints === "boolean" ? hunk.config.manual_checkpoints : agentHost === null;
   const showStatus = hunk.config.status_line !== false;
   const autoRefreshSeconds = Number(hunk.config.auto_refresh_seconds ?? 0);
   const turnSettleMs = Number(hunk.config.turn_settle_ms ?? 1500);
@@ -418,7 +419,7 @@ export default function (hunk: HunkExtensionAPI) {
       body: [
         `source: ${BUILD.source}`,
         `extension API: ${hunk.apiVersion}`,
-        `herdr: ${herdrSocket ? `socket ${herdrSocket}` : "off"} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
+        `herdr: ${describeAgentHost(agentHost)} · baselines: ${manual ? "manual (C / r)" : "automatic (agent turns)"}`,
         `worktree: ${repo} · checkpoint mode: ${state.mode.kind}${base ? ` (baseline ${short(base.sha)}${state.mode.kind === "on" && state.mode.skipNext ? ", next skipped" : ""})` : ""} · stored rounds: ${state.rounds.length}`,
       ].join("\n"),
       confirmLabel: "ok",
@@ -445,10 +446,9 @@ export default function (hunk: HunkExtensionAPI) {
 
   /** Follow the agents of this worktree once the repo is known and herdr is around. */
   function ensureWatcher() {
-    if (state.watcher || !herdrSocket || !state.repo) return;
+    if (state.watcher || !agentHost || !state.repo) return;
     const repo = state.repo;
-    state.watcher = new HerdrTurnWatcher({
-      socket: herdrSocket,
+    state.watcher = createTurnWatcher(agentHost, {
       repoRoot: repo.root,
       settleMs: turnSettleMs,
       log: (message) => {
@@ -531,7 +531,7 @@ export default function (hunk: HunkExtensionAPI) {
       ensureWatcher();
       if (state.view.kind === "since-checkpoint") poller?.start(repo);
       else poller?.stop();
-      if (!manual && !herdrSocket && !state.warnedAboutAutomatic) {
+      if (!manual && !agentHost && !state.warnedAboutAutomatic) {
         state.warnedAboutAutomatic = true;
         ctx.notify(
           "hunk-checkpoint: automatic baselines need herdr; set manual_checkpoints = true or press C to mark them yourself",

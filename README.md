@@ -92,8 +92,9 @@ since view is a pinned snapshot that moves on at turn end (herdr) or on `r`
 
 - **Automatic** (herdr): the resting→working edge of any agent whose cwd is in
   this worktree marks the baseline (only if the tree changed since the last
-  one). Agent status comes over herdr's socket (`HERDR_SOCKET_PATH`), no herdr
-  CLI involved.
+  one). Agent status comes over herdr's socket, no herdr CLI involved: the
+  herdr app's (herdr-core, `HC_TERMINAL_SOCKET`) when the window runs under
+  it, else the TUI's (`HERDR_SOCKET_PATH`).
 - **Manual**: press `C` once to set the first baseline. From then on `r` is
   the turn boundary: it snapshots the working tree as the next round and shows
   it against the previous one. Edit, `C`, edit, `r`, edit, `r`: the last
@@ -161,12 +162,16 @@ live window to any `hunk diff …` command. So:
   session with `-- diff` simply puts you back in the full view. Checkpoint
   mode is per window and starts off; stored rounds are only used when picked
   with `X` or mounted by `hunk checkpoint sync`.
-- **Agent turns** come from herdr's socket: the roster (`agent.list`) filtered
-  to agents whose cwd is inside the worktree, plus a live `events.subscribe`
-  on their `pane.agent_status_changed`. Any working member means the worktree
-  works; a turn ends once every member has rested for `turn_settle_ms`, and a
-  permission prompt (`blocked`) holds it open. This mirrors herdr-reviewr's
-  turn tracking.
+- **Agent turns** come from herdr's socket, filtered to agents whose cwd is
+  inside the worktree. Under the herdr app that is one herdr-core
+  `events.subscribe`: its reply is every live terminal, and the `status`,
+  `foreground`, `created` and `finished` events that follow keep the roster
+  current (terminals whose program never reported a status, such as plain
+  shells, are not agents). Under the TUI it is the `agent.list` roster plus a
+  live `events.subscribe` on each member's `pane.agent_status_changed`. Any
+  working member means the worktree works; a turn ends once every member has
+  rested for `turn_settle_ms`, and a permission prompt (`blocked`) or an
+  errored agent holds it open. This mirrors herdr-reviewr's turn tracking.
 
 ## Limitations
 
@@ -193,7 +198,7 @@ live window to any `hunk diff …` command. So:
 [extension.hunk-checkpoint]
 status_line = true          # show the checkpoint item on the status row
 auto_refresh_seconds = 0    # >0: poll the working tree while in the since view
-herdr = true                # follow agent turns when running inside herdr
+herdr = true                # follow agent turns when running inside herdr (app or TUI)
 manual_checkpoints = false  # default: true outside herdr, false inside
 turn_settle_ms = 1500       # rest must last this long before a turn counts as ended
 ```
