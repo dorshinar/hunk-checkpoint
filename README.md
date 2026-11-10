@@ -64,6 +64,8 @@ The status row shows the mode, the baseline, and which view you are in.
    press `C` before prompting.
 6. When the agent's turn ends, Hunk reloads as *changes since the baseline*:
    only what the agent did in response.
+   A turn that changed nothing (a question, a plan) reloads nothing: the
+   last round with changes stays on screen rather than an empty one.
 7. Review that, leave notes, prompt again. Each turn sets a new baseline and
    each turn end reloads the delta. `x` turns the mode off and returns to the
    full diff.

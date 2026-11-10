@@ -15,7 +15,7 @@ describe("view mode detection", () => {
   });
 
   it("recognises the since-checkpoint view by its base and resolves it to the round", () => {
-    assert.deepEqual(deriveView({ title: "repo 8b10a5d..f821d00" }, [ROUND]), { kind: "since-checkpoint", base: ROUND });
+    assert.deepEqual(deriveView({ title: "repo 8b10a5d..f821d00" }, [ROUND]), { kind: "since-checkpoint", base: ROUND, head: "f821d00" });
     assert.deepEqual(deriveView({ title: "repo 1111111..f821d00" }, [ROUND]), { kind: "other" });
     assert.deepEqual(deriveView({ title: "repo working tree" }, [ROUND]), { kind: "working-tree" });
     assert.deepEqual(deriveView({ title: "repo staged changes" }, [ROUND]), { kind: "other" });
@@ -38,7 +38,7 @@ describe("view mode detection", () => {
     const on = { kind: "on", baseline: ROUND, skipNext: false } as const;
     const skipping = { kind: "on", baseline: ROUND, skipNext: true } as const;
     const full = { kind: "working-tree" } as const;
-    const since = { kind: "since-checkpoint", base: ROUND } as const;
+    const since = { kind: "since-checkpoint", base: ROUND, head: "f821d00" } as const;
     assert.match(text(statusSpans({ mode: off, view: full, manual: false, busy: null, keys })), /off · x on/);
     assert.match(text(statusSpans({ mode: armed, view: full, manual: false, busy: null, keys })), /on · baseline at the next agent turn/);
     assert.match(text(statusSpans({ mode: armed, view: full, manual: true, busy: null, keys })), /on · C sets the baseline/);

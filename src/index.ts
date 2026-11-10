@@ -7,11 +7,12 @@ import type {
 } from "hunkdiff/extension";
 import { buildStamp } from "./build.ts";
 import { createCliHandler } from "./cli.ts";
-import { listCheckpoints, markCheckpoint, resolveRepo, short, snapshotLive, type Checkpoint, type GitRepo } from "./git.ts";
+import { listCheckpoints, markCheckpoint, resolveRepo, short, type Checkpoint, type GitRepo } from "./git.ts";
 import { createTurnWatcher, describeAgentHost, detectAgentHost } from "./agent-host.ts";
 import type { TurnWatcher } from "./turns.ts";
 import { deriveView, formatAge, onBaseline, statusSpans, type Activity, type CheckpointMode, type ViewMode } from "./mode.ts";
 import { WorkingTreePoller } from "./poll.ts";
+import { snapshotRound, type RoundRange } from "./round.ts";
 import { listSessions, reloadSession, selectSession, type LiveSession, type ReviewTarget } from "./session.ts";
 
 /**
@@ -27,7 +28,8 @@ import { listSessions, reloadSession, selectSession, type LiveSession, type Revi
  *    snapshots the working tree — the baseline is what you reviewed.
  *    Outside herdr (or with `manual_checkpoints = true`) you press `C`.
  * 5. When the agent's turn ends, the review reloads as "changes since the
- *    baseline": only what the agent did in response.
+ *    baseline": only what the agent did in response. A turn that changed
+ *    nothing leaves the last round with changes on screen.
  * 6. If the agent got it wrong, press `S` before prompting again: the next
  *    turn keeps the baseline, so both attempts show together against what
  *    you reviewed.
@@ -79,7 +81,7 @@ interface State {
 }
 
 /** What showing a round did: reloaded the review, left it alone (nothing changed), or could not run. */
-type RoundOutcome = { kind: "shown"; to: string } | { kind: "empty" } | { kind: "busy" };
+type RoundOutcome = ({ kind: "shown" } & RoundRange) | { kind: "empty" } | { kind: "busy" };
 
 export default function (hunk: HunkExtensionAPI) {
   const agentHost = hunk.config.herdr !== false ? detectAgentHost() : null;
@@ -215,30 +217,38 @@ export default function (hunk: HunkExtensionAPI) {
     }
   }
 
-  /** Point the session at `base..<snapshot>` as the one job in flight; `snapshot` resolves nothing when there is nothing to show. */
+  /** Point the session at the range `snapshot` resolves, as the one job in flight; it resolves nothing when there is nothing to show. */
   async function mountRound(
     host: ReviewHost,
     repo: GitRepo,
-    base: string,
-    snapshot: () => Promise<string | null | undefined>,
+    snapshot: () => Promise<RoundRange | null>,
   ): Promise<RoundOutcome> {
     const outcome = await withBusy(host, "snapshotting", async (phase): Promise<RoundOutcome> => {
-      const to = await snapshot();
-      if (!to) return { kind: "empty" };
+      const range = await snapshot();
+      if (!range) return { kind: "empty" };
       phase("reloading");
-      await reload(repo, { kind: "range", from: base, to });
-      return { kind: "shown", to };
+      await reload(repo, { kind: "range", ...range });
+      return { kind: "shown", ...range };
     });
     return outcome ?? { kind: "busy" };
   }
 
-  /**
-   * Show the working tree against `base`. The full diff never gives way to an
-   * empty round; only a mounted since view is refreshed when nothing changed.
-   */
+  /** Show the working tree against `base`; see `snapshotRound` for what stays on screen when nothing changed. */
   function showRound(host: ReviewHost, repo: GitRepo, base: string) {
-    const refreshEmpty = state.view.kind === "since-checkpoint";
-    return mountRound(host, repo, base, () => snapshotLive(repo, base, { skipIfSameAs: refreshEmpty ? undefined : base }));
+    return mountRound(host, repo, () => snapshotRound(repo, base, state.view));
+  }
+
+  /** Whether `outcome` put the changes since `base` on screen, rather than leaving or refreshing an earlier round. */
+  function showsSince(outcome: RoundOutcome, base: Checkpoint) {
+    return outcome.kind === "shown" && outcome.from === base.sha;
+  }
+
+  /** Names the earlier round left on screen when nothing changed since `base`. */
+  function stillShowing(base: Checkpoint) {
+    const view = state.view;
+    return view.kind === "since-checkpoint" && view.base.sha !== base.sha
+      ? ` — still showing changes since ${short(view.base.sha)}`
+      : "";
   }
 
   /**
@@ -246,7 +256,10 @@ export default function (hunk: HunkExtensionAPI) {
    * baseline, shown against `base`. A round is never recorded twice.
    */
   function closeRound(host: ReviewHost, repo: GitRepo, base: string) {
-    return mountRound(host, repo, base, async () => (await markBaseline(repo, base))?.sha);
+    return mountRound(host, repo, async () => {
+      const next = await markBaseline(repo, base);
+      return next ? { from: base, to: next.sha } : null;
+    });
   }
 
   /** Opt-in: keep a mounted since-view current while the tree moves (for setups without herdr). */
@@ -337,11 +350,11 @@ export default function (hunk: HunkExtensionAPI) {
     const outcome = await (close ? closeRound(ctx, repo, base.sha) : showRound(ctx, repo, base.sha));
     if (outcome.kind === "busy") return;
     if (manual && mode.skipNext) consumeSkip();
-    if (outcome.kind === "empty") {
-      ctx.notify(`Nothing changed since ${manual ? "round" : "baseline"} ${short(base.sha)} yet`);
-    } else if (outcome.kind === "shown" && close) {
+    if (outcome.kind !== "shown" || !showsSince(outcome, base)) {
+      ctx.notify(`Nothing changed since ${manual ? "round" : "baseline"} ${short(base.sha)} yet${stillShowing(base)}`);
+    } else if (close) {
       ctx.notify(`Round ${short(outcome.to)} closed — showing it against ${short(base.sha)}`);
-    } else if (outcome.kind === "shown" && manual) {
+    } else if (manual) {
       ctx.notify(`Showing changes since round ${short(base.sha)} — no round closed`);
     }
   }
@@ -405,8 +418,9 @@ export default function (hunk: HunkExtensionAPI) {
       // turn ends refresh against it (until the next turn start replaces it).
       state.mode = onBaseline(target);
       publishStatus();
-      if ((await showRound(ctx, repo, target.sha)).kind === "empty") {
-        ctx.notify(`Nothing changed since round ${short(target.sha)}`);
+      const outcome = await showRound(ctx, repo, target.sha);
+      if (outcome.kind !== "busy" && !showsSince(outcome, target)) {
+        ctx.notify(`Nothing changed since round ${short(target.sha)}${stillShowing(target)}`);
       }
     },
   );
@@ -506,9 +520,9 @@ export default function (hunk: HunkExtensionAPI) {
     const outcome = await showRound(host, repo, base.sha);
     if (outcome.kind === "busy") return;
     host.notify(
-      outcome.kind === "shown"
+      showsSince(outcome, base)
         ? `Agent finished — showing changes since ${short(base.sha)} (${KEYS.toggle} for the full diff)`
-        : `Agent finished — nothing changed since baseline ${short(base.sha)}`,
+        : `Agent finished — nothing changed since baseline ${short(base.sha)}${stillShowing(base)}`,
     );
   }
 
